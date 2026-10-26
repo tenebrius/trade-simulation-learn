@@ -51,6 +51,9 @@ MIN_PROFIT = 1.0                # TradeGuild.DefaultMinProfitToConsiderTrade
 MONEY_RESERVE_TIME = 60.0       # TradeGuild.MoneyReserveTime
 ROUTE_SWITCH_TIMEOUT = 30.0     # TradeGuild.TraderRouteSwitchTimeOut
 NEW_TRADER_COST = 200.0         # ~SpawnGuildBranchDefaultCost, reused as trader price
+MAX_PROFIT_DEV = 0.5            # TraderConstants.MaxProfitDeviationFraction
+GUILD_EMERGENCY_RESERVE = 100.0 # (simplification) guild never lends below this
+TRADER_BUDGET_KEEP = 150.0      # (simplification) cash a trader keeps after a trip
 TRADER_CAPACITY = 10
 TRADER_SPEED = 1.0              # distance units / second
 MOVE_PROB = 0.1                 # Max move in/out probability per sec (scaled down below)
@@ -142,9 +145,10 @@ class Trader:
     guild: "Guild"
     city: City
     task: str = "idle"           # idle | to_source | to_dest
-    route: tuple = None          # (src, dst, good)
-    cargo: int = 0
-    paid: float = 0.0
+    route: tuple = None          # (src, dst, [(good, qty), ...])
+    route_value: float = 0.0     # profit/min of the route currently followed
+    cargo: list = field(default_factory=list)   # [(good, qty, paid_per_unit)]
+    budget: float = 0.0          # trader's own cash (FTraderStats.Budget)
     eta: float = 0.0
     switch_timer: float = 0.0
     profit_avg: float = 0.0
@@ -327,29 +331,60 @@ class Economy:
             self.mean[g] = self.glob[g]   # game re-syncs the reference to global each tick
 
     # ---------------------------------------------------------- traders
-    def best_route(self, tr):
-        best, best_score = None, MIN_PROFIT
+    def transport_orders(self, src, dst):
+        """Pair src sell orders with dst buy orders: [(good, amount, sell_ppu, buy_ppu)]."""
+        orders = []
+        for g in GOODS:
+            s, d = src.storage[g], dst.storage[g]
+            amount = min(s.amount - s.desired, d.desired - d.amount)
+            if amount > 0 and d.buy_price > s.sell_price:
+                orders.append((g, amount, s.sell_price, d.buy_price))
+        return orders
+
+    @staticmethod
+    def fill_wagon(orders, capacity):
+        """Greedy fill: repeatedly take the order with the largest qty x profit-per-unit."""
+        load, profit, cost = [], 0.0, 0.0
+        left = list(orders)
+        while capacity > 0 and left:
+            best = max(left, key=lambda o: min(o[1], capacity) * (o[3] - o[2]))
+            g, amount, sell, buy = best
+            qty = min(amount, capacity)
+            load.append((g, qty))
+            profit += qty * (buy - sell)
+            cost += qty * sell
+            capacity -= qty
+            left.remove(best)
+        return load, profit, cost
+
+    def plan_route(self, tr):
+        """Return (src, dst, load, value). Options must beat the current route by a noisy margin."""
+        r = self.rng.uniform(-1.0, 1.0)
+        noise = 1.0 + math.copysign(1.0, r) * MAX_PROFIT_DEV * r * r
+        best, best_value = None, max(MIN_PROFIT, tr.route_value)
+        baseline = tr.route_value
         for src in self.cities:
             for dst in self.cities:
                 if src is dst:
                     continue
-                for g in GOODS:
-                    s, d = src.storage[g], dst.storage[g]
-                    avail = s.amount - s.desired
-                    room = d.desired - d.amount
-                    if avail <= 0 or room <= 0:
-                        continue
-                    qty = min(TRADER_CAPACITY, avail, room)
-                    afford = int(min(tr.guild.cash / max(s.sell_price, 0.1), dst.cash / max(d.buy_price, 0.1)))
-                    qty = min(qty, afford)
-                    if qty <= 0:
-                        continue
-                    profit = (d.buy_price - s.sell_price) * qty
-                    t = (tr.city.dist(src) + src.dist(dst)) / TRADER_SPEED + 4
-                    score = profit / t * 60   # profit per minute
-                    if profit >= MIN_PROFIT and score > best_score:
-                        best, best_score = (src, dst, g, qty), score
+                load, profit, _ = self.fill_wagon(self.transport_orders(src, dst), TRADER_CAPACITY)
+                if profit < MIN_PROFIT:
+                    continue
+                t = (tr.city.dist(src) + src.dist(dst)) / TRADER_SPEED + 4
+                value = profit / t * 60   # profit per minute
+                if value > best_value and value > noise * baseline:
+                    best, best_value = (src, dst, load, value), value
         return best
+
+    def request_budget(self, tr, amount):
+        """Trader asks its guild for cash: full gap, then half, then a quarter."""
+        gd = tr.guild
+        for part in (amount, amount * 0.5, amount * 0.25):
+            if part < gd.cash - GUILD_EMERGENCY_RESERVE:
+                gd.cash -= part
+                tr.budget += part
+                return True
+        return False
 
     def run_traders(self, dt):
         for gd in self.guilds:
@@ -358,52 +393,65 @@ class Economy:
                     tr.switch_timer -= dt
                     if tr.switch_timer > 0:
                         continue
-                    r = self.best_route(tr)
                     tr.switch_timer = ROUTE_SWITCH_TIMEOUT / 10
-                    if r:
-                        src, dst, g, qty = r
-                        tr.route = (src, dst, g, qty)
-                        tr.task, tr.eta = "to_source", tr.city.dist(src) / TRADER_SPEED + 2
+                    plan = self.plan_route(tr)
+                    if plan is None and tr.route is None:
+                        continue
+                    if plan is not None:
+                        tr.route, tr.route_value = plan[:3], plan[3]
+                    tr.task, tr.eta = "to_source", tr.city.dist(tr.route[0]) / TRADER_SPEED + 2
                 elif tr.task == "to_source":
                     tr.eta -= dt
-                    if tr.eta <= 0:
-                        src, dst, g, qty = tr.route
+                    if tr.eta > 0:
+                        continue
+                    src, dst, _ = tr.route
+                    load, _, cost = self.fill_wagon(self.transport_orders(src, dst), TRADER_CAPACITY)
+                    if cost > tr.budget:
+                        self.request_budget(tr, cost - tr.budget)
+                    tr.city = src
+                    for g, qty in load:
                         st = src.storage[g]
-                        qty = min(qty, st.amount - st.desired, int(gd.cash / max(st.sell_price, 0.1)))
+                        qty = min(qty, int(tr.budget / max(st.sell_price, 0.1)))
                         if qty <= 0:
-                            tr.task, tr.city = "idle", src
                             continue
                         price = st.sell_price
                         net_to_port = price / (1 + CITY_TAX)
                         st.amount -= qty
                         st.flow_acc -= qty
-                        gd.cash -= price * qty
+                        tr.budget -= price * qty
                         src.cash += net_to_port * qty
                         src.tax_income += (price - net_to_port) * qty
                         src.income_rate += net_to_port * qty
-                        tr.cargo, tr.paid, tr.city = qty, price * qty, src
-                        tr.task, tr.eta = "to_dest", src.dist(dst) / TRADER_SPEED + 2
+                        tr.cargo.append((g, qty, price))
+                    if not tr.cargo:
+                        tr.task, tr.route, tr.route_value = "idle", None, 0.0
+                        continue
+                    tr.task, tr.eta = "to_dest", src.dist(dst) / TRADER_SPEED + 2
                 elif tr.task == "to_dest":
                     tr.eta -= dt
-                    if tr.eta <= 0:
-                        src, dst, g, _ = tr.route
+                    if tr.eta > 0:
+                        continue
+                    _, dst, _ = tr.route
+                    profit = 0.0
+                    for g, qty, paid in tr.cargo:
                         st = dst.storage[g]
-                        qty = min(tr.cargo, st.max_amount - st.amount)
                         price = st.buy_price
                         gross = price * (1 + CITY_TAX)       # port pays price + tax
-                        if dst.cash < gross * qty:
-                            qty = int(dst.cash / gross)
+                        qty = min(qty, st.max_amount - st.amount, int(dst.cash / gross))
                         st.amount += qty
                         st.flow_acc += qty
                         dst.cash -= gross * qty
                         dst.tax_income += (gross - price) * qty
                         dst.spend_rate += gross * qty
-                        revenue = price * qty
-                        gd.cash += revenue
-                        profit = revenue - tr.paid
-                        gd.earned += profit
-                        tr.profit_avg += (profit - tr.profit_avg) * 0.2
-                        tr.cargo, tr.task, tr.city = 0, "idle", dst
+                        tr.budget += price * qty
+                        profit += (price - paid) * qty   # unsold units are written off
+                    gd.earned += profit
+                    tr.profit_avg += (profit - tr.profit_avg) * 0.2
+                    tr.cargo, tr.task, tr.city = [], "idle", dst
+                    # surplus trader cash flows back to the guild bank
+                    if tr.budget > TRADER_BUDGET_KEEP:
+                        gd.cash += tr.budget - TRADER_BUDGET_KEEP
+                        tr.budget = TRADER_BUDGET_KEEP
             # guild expansion / contraction
             reserve = MONEY_RESERVE_TIME * 1.0 * len(gd.traders)
             if gd.cash > reserve + NEW_TRADER_COST * 2 and len(gd.traders) < 12:

@@ -136,7 +136,20 @@ These feed back into pricing through two factors:
 
 So a port running out of money automatically lowers buy prices and sells harder.
 
-## 5. Guilds and traders [struct + defaults], formulas still to be confirmed
+## 5. Guilds and traders
+
+### 5.1 Orders: how goods get matched [code + struct]
+Ports don't talk to traders directly. Each port posts **market orders** (`FMarketOrder`: good, amount, price per unit, buy or sell) with the economy subsystem. Volumes come from section 3.1 and prices from section 3.4. A **transport order** (`FTransportOrder`) pairs a source port's sell order with a target port's buy order. It records the amount, the sell price per unit (what the trader pays), the buy price per unit (what the trader receives) and the profit per unit. That the profit per unit is buy minus sell is inferred from the field names. When a trader commits to a load it reserves the orders as a `FTransportContract`, which also records taxes and subsidies for both ends.
+
+### 5.2 Route choice [code]
+- **Filling the wagon**: to value a candidate route, the trader greedily fills its capacity from that route's transport orders. At each step it takes the order with the largest min(order amount, remaining capacity) × profit per unit, then repeats with the remaining capacity. Wagons therefore carry **mixed goods**. Port subsidies are added to the value, capped by what the port can still pay out.
+- **Noisy switching**: a candidate replaces the current choice only if it beats the best so far **and** beats the baseline × (1 + s · 0.5 · r²). Here r is a fresh random number in [−1, 1], s is its sign, and 0.5 is `MaxProfitDeviationFraction`. Most draws are close to 1, but now and then a trader demands up to 50% more, or accepts up to 50% less. This spreads traders across routes instead of letting them all herd onto the single best one.
+- **Utilization** = loaded amount ÷ capacity, stored as `CurrentTraderUtilizationFraction` and fed into the guild's route statistics.
+
+### 5.3 Trader cash [code]
+Each trader carries its own cash (`TraderStats.Budget`). If the planned purchase costs more than the budget, the trader asks its guild for the gap. If that's refused it asks for half, then for a quarter. The guild approves a request only if **account − emergency reserve > requested amount**; the cash then moves from the guild bank into the trader's budget. The trader tick is a state machine over `ETraderTask`: move to route, trading, collect maintenance resources, maintenance, resupply, move to scrap, scrap.
+
+### 5.4 Guild strategy [struct + defaults], formulas still to be confirmed
 
 Guild constants **[defaults]**:
 - New guild costs 500; a new branch costs 200 (founding cost factor 2.0, gain bonus 10×, first founding 20×).
@@ -180,9 +193,10 @@ Routes (`FTradeRouteRevenue` / `FTradeGuildTradeRoute`) track gross profit, inve
 ---
 
 ### Simulation
-`ltt_sim.py` reimplements sections 2–4 faithfully. It uses simplified stand-ins for sections 5–6:
-- greedy profit-per-minute route choice with the 1-coin minimum;
+`ltt_sim.py` reimplements sections 2–4 and 5.1–5.3. It uses simplified stand-ins for the guild strategy (5.4) and the city side (section 6):
+- transport orders are built on the fly from port surpluses and shortfalls;
 - guilds hire when profitable and fire when broke;
+- the emergency reserve and the cash a trader keeps between trips are fixed values;
 - residents bring a fixed coin income;
 - migration based on satisfaction.
 
