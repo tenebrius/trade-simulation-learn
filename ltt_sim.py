@@ -41,7 +41,9 @@ STOCK_INTEGRATION = 300.0       # StockDataIntegrationTime
 MEAN_TO_GLOBAL_W = 0.01         # EconomyConstants.MeanToGlobalPriceWeightPerSec
 THEO_TO_GLOBAL_W = 0.002        # EconomyConstants.TheoreticalToGlobalPriceWeightPerSec
 MAX_GLOBAL_REL_CHG = 0.00033    # MaxGlobalRelativePriceChangePerSec
-MEAN_OBSERVE_W = 0.005          # (inferred) how fast the mean follows observed port prices
+REL_MONEY_W = 0.05              # EconomyConstants.RelativeMoneyVolumeToMarketWeightPerSec
+DESIRED_CASH_TO_GOODS = 2.0     # EconomyConstants.DesiredCashVolumeToGoodsValue
+MIN_GOOD_VOLUME_W = 0.05        # EconomyConstants.MinimumGoodVolumeWeightPercentage (used as a cap)
 RESIDENT_INCOME = 0.05          # (simplification) coins per resident per second paid into the city
 CITY_TAX = 0.10                 # EconomyConstants.StartCityTax (%)
 CITY_START_BUDGET = 1000.0
@@ -254,7 +256,8 @@ class Economy:
                 missing = st.desired - st.amount
                 if missing > 0:      # ---- buying side
                     rel = missing / max(st.desired, 1)
-                    st.integral += rel * dt
+                    # windowed sum of the discrepancy over the last ~STOCK_INTEGRATION seconds
+                    st.integral = st.integral * (1 - dt / STOCK_INTEGRATION) + rel * dt
                     terms = [
                         P_W * rel,                                   # proportional
                         -D1_W * st.trend,                            # stock already rising -> relax
@@ -274,7 +277,7 @@ class Economy:
                 else:                # ---- selling side
                     surplus = -missing
                     rel = surplus / max(st.max_amount - st.desired, 1)
-                    st.integral = max(0.0, st.integral - rel * dt)
+                    st.integral = st.integral * (1 - dt / STOCK_INTEGRATION)
                     terms = [
                         P_W * rel,
                         D1_W * st.trend,                             # stock still rising -> sell harder
@@ -299,18 +302,29 @@ class Economy:
         return max(lo, min(hi, price + st.price_delta_smooth))
 
     def update_global_prices(self, dt):
-        # Mean follows the observed port prices but is tied to the global price; the
-        # global price drifts slowly toward the mean and the theoretical value, rate-capped.
+        # Mean = volume-weighted average of open buy-order prices (ports below target).
+        # Global drifts toward mean and theoretical value, plus a money-supply term:
+        # too much cash relative to DESIRED_CASH_TO_GOODS x goods value inflates prices.
+        volume = {g: sum(c.storage[g].amount for c in self.cities) for g in GOODS}
+        total_volume = sum(volume.values())
+        goods_value = sum(volume[g] * self.glob[g] for g in GOODS)
+        cash = sum(c.cash for c in self.cities) + sum(gd.cash for gd in self.guilds)
+        money_dev = (cash - DESIRED_CASH_TO_GOODS * goods_value) / cash if cash > 0 else 0.0
+        self.money_dev = money_dev
         for g in GOODS:
-            prices = [c.storage[g].buy_price if c.storage[g].amount < c.storage[g].desired
-                      else c.storage[g].sell_price for c in self.cities]
-            observed = sum(prices) / len(prices)
-            self.mean[g] += ((observed - self.mean[g]) * MEAN_OBSERVE_W
-                             + (self.glob[g] - self.mean[g]) * MEAN_TO_GLOBAL_W) * dt
-            drift = ((self.mean[g] - self.glob[g]) * MEAN_TO_GLOBAL_W
-                     + (self.theo[g] - self.glob[g]) * THEO_TO_GLOBAL_W) * dt
-            cap = self.glob[g] * MAX_GLOBAL_REL_CHG * dt
-            self.glob[g] += max(-cap, min(cap, drift))
+            orders = [(c.storage[g].desired - c.storage[g].amount, c.storage[g].buy_price)
+                      for c in self.cities if c.storage[g].amount < c.storage[g].desired]
+            vol = sum(a for a, _ in orders)
+            if vol > 0:
+                self.mean[g] = sum(a * p for a, p in orders) / vol
+            glob = self.glob[g]
+            glob += (self.mean[g] - glob) * MEAN_TO_GLOBAL_W * dt
+            glob += (self.theo[g] - glob) * THEO_TO_GLOBAL_W * dt
+            if total_volume > 0:
+                share = min(MIN_GOOD_VOLUME_W, volume[g] / total_volume)
+                glob += share * glob * dt * REL_MONEY_W * money_dev
+            self.glob[g] = max(MIN_PRICE, glob)
+            self.mean[g] = self.glob[g]   # game re-syncs the reference to global each tick
 
     # ---------------------------------------------------------- traders
     def best_route(self, tr):

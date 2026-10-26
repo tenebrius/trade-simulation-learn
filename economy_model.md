@@ -33,17 +33,19 @@ For each good, `FGlobalResourceData` holds:
 
 Market totals are recomputed as the sum over goods of (stock + in transit) × price, separately for the mean, global and theoretical prices **[code]**.
 
-Drift constants **[defaults]**:
+The global layer runs as a fixed sequence of steps inside the economy subsystem's tick. The ones that matter here **[code]**:
 
-| Constant | Value |
-|---|---|
-| `MeanToGlobalPriceWeightPerSec` | 0.01 |
-| `TheoreticalToGlobalPriceWeightPerSec` | 0.002 |
-| `MaxGlobalRelativePriceChangePerSec` | 0.00033 (about 1.2% per hour) |
-| `RelativeMoneyVolumeToMarketWeightPerSec` | 0.05 |
-| `DesiredCashVolumeToGoodsValue` | 2.0 |
+1. **Mean price** = volume-weighted average of all open **buy** market orders for the good: Σ(amount × price per unit) / Σ amount. The value is only replaced when such orders exist.
+2. **Market totals**: the current, global and theoretical market values are recomputed as above.
+3. **Global price drift**, once per tick for each good:
+   - `money_dev = (C − 2.0 × TotalGlobalMarketValue) / C`, where C is a global coin quantity read from the economy registry (most likely the coins in circulation) and 2.0 is `DesiredCashVolumeToGoodsValue`. The result is stored as `RelativeMoneyVolumeToMarketValueDeviation`.
+   - `global += (mean − global) × 0.01 × dt`, with 0.01 = `MeanToGlobalPriceWeightPerSec`.
+   - `global += (theoretical − global) × 0.002 × dt`, with 0.002 = `TheoreticalToGlobalPriceWeightPerSec`.
+   - `global += min(0.05, good_volume / total_volume) × global × dt × 0.05 × money_dev`. Here 0.05 = `RelativeMoneyVolumeToMarketWeightPerSec` and `MinimumGoodVolumeWeightPercentage` acts as a *cap*. Too much money relative to goods inflates prices; too little deflates them; goods that make up more of the market react more.
+   - Global floor is 0.1, and NaN is reset to 0.1.
+   - Unless a per-good flag is set, the mean is then **overwritten with the new global**. Ports therefore price against a reference that moves only at these slow rates, which is what keeps the band-based controller in section 3 from feeding back on itself.
 
-The money-supply target is that total cash ≈ 2 × the value of all goods. The exact drift equation is **[struct]**, and still to be confirmed.
+`MaxGlobalRelativePriceChangePerSec` (0.00033) is not used here. The port controller uses it as an absolute cap on each price step: that same registry quantity × 0.00033 × dt.
 
 ## 3. Port pricing: the core loop [code]
 
