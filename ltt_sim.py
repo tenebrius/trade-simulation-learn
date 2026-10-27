@@ -4,9 +4,10 @@ Let Them Trade (see economy_model.md). Original implementation, no game code.
 
 Fixed set of cities. Each city has:
   - a trade port (storage per good, cash bank, buy/sell prices per good)
-  - production buildings (recipes) that pull inputs from / push outputs to the port
-  - residents that consume goods; population drifts with supply satisfaction
-Guilds own traders that haul goods between ports along the most profitable route.
+  - production buildings (recipes) staffed by residents; productivity = staffed share
+  - housing with residents who consume goods, get happier or unhappier, pay coins,
+    and move in or out by the game's occupancy-vs-happiness rule
+Guilds lease branches in ports and own traders that haul goods between ports.
 
 Run:  python ltt_sim.py [--seconds 3600] [--seed 1] [--csv out.csv]
 """
@@ -44,52 +45,78 @@ MAX_GLOBAL_REL_CHG = 0.00033    # MaxGlobalRelativePriceChangePerSec
 REL_MONEY_W = 0.05              # EconomyConstants.RelativeMoneyVolumeToMarketWeightPerSec
 DESIRED_CASH_TO_GOODS = 2.0     # EconomyConstants.DesiredCashVolumeToGoodsValue
 MIN_GOOD_VOLUME_W = 0.05        # EconomyConstants.MinimumGoodVolumeWeightPercentage (used as a cap)
-RESIDENT_INCOME = 0.05          # (simplification) coins per resident per second paid into the city
 CITY_TAX = 0.10                 # EconomyConstants.StartCityTax (%)
 CITY_START_BUDGET = 1000.0
 MIN_PROFIT = 1.0                # TradeGuild.DefaultMinProfitToConsiderTrade
 MONEY_RESERVE_TIME = 60.0       # TradeGuild.MoneyReserveTime
 ROUTE_SWITCH_TIMEOUT = 30.0     # TradeGuild.TraderRouteSwitchTimeOut
-NEW_TRADER_COST = 200.0         # ~SpawnGuildBranchDefaultCost, reused as trader price
 MAX_PROFIT_DEV = 0.5            # TraderConstants.MaxProfitDeviationFraction
 GUILD_EMERGENCY_RESERVE = 100.0 # (simplification) guild never lends below this
 TRADER_BUDGET_KEEP = 150.0      # (simplification) cash a trader keeps after a trip
 TRADER_CAPACITY = 10
 TRADER_SPEED = 1.0              # distance units / second
-MOVE_PROB = 0.1                 # Max move in/out probability per sec (scaled down below)
+# guilds and branches
+BRANCH_COST = 200.0             # TradeGuild.SpawnGuildBranchDefaultCost (stand-in for the wagon price)
+BRANCH_LEASE = 0.1              # TradeGuild.DefaultBranchLease, coins per second paid to the port
+INCLUDED_LEASE_TIME = 120.0     # TradeGuild.IncludedFoundingLeaseTime (prepaid lease on founding)
+FOUND_BRANCH_TIMEOUT = 60.0     # TradeGuild.FoundNewBranchTimeOut (cooldown after each branch)
+NEW_GUILD_COST = 500.0          # TradeGuild.SpawnNewGuildDefaultCost, paid by the founding port
+MAX_GUILDS = 3                  # (sim) game default MaxSimultaneousFreeTradeGuilds is 5
+GUILD_FOUNDING_TIMEOUT = 300.0  # (assumption) default not recovered; x0.1 when no guild is left
+# residents (C++ defaults; the game's data assets may override them)
+MAX_MOVE_PROB = 0.1             # CityConstants.MaxMoveInProbabilityPerSec (used for in AND out)
+HAPPINESS_SPEED = 0.01          # InhabitantSpecs.MaxRelativeHappinessChangeSpeed
+CRITICAL_HAPPINESS = 0.5        # (assumption) residential CriticalAverageHappiness
+BASE_HAPPINESS, JOB_HAPPINESS, UNEMPLOYED_HAPPINESS = 0.5, 0.1, -0.15   # (sim values)
+BASE_PAY, BONUS_PAY = 0.03, 0.03  # per resident per second; C++ defaults are 1.0/1.0, scaled to sim prices
+PAY_INTERVAL = 10.0             # (assumption) CoinConstants.ResidenceCoinPayInterval
+WORKERS_PER_BUILDING = 8
+# theoretical price solver (PricingPrediction)
+THEO_MAX_STEP, THEO_PASSES, THEO_TOL, THEO_FLOOR = 0.01, 10, 0.001, 0.01
 
 # ---------------------------------------------------------------- world data
-GOODS = {  # base value used to seed theoretical prices for raw goods
-    "grain": 4.0, "wood": 5.0, "fish": 6.0,
-    "flour": None, "bread": None, "tools": None,
+GOODS = ["grain", "wood", "fish", "flour", "bread", "tools"]
+RECIPES = {  # output: (inputs{good: qty}, out_qty, seconds_per_cycle, labour per cycle)
+    "grain": ({}, 2, 10.0, 1),
+    "wood": ({}, 2, 10.0, 1),
+    "fish": ({}, 1, 8.0, 1),
+    "flour": ({"grain": 2}, 2, 10.0, 1),
+    "bread": ({"flour": 2}, 3, 12.0, 1),
+    "tools": ({"wood": 3}, 1, 15.0, 2),
 }
-RECIPES = {  # output: (inputs{good: qty}, out_qty, seconds_per_cycle)
-    "grain": ({}, 2, 10.0),
-    "wood": ({}, 2, 10.0),
-    "fish": ({}, 1, 8.0),
-    "flour": ({"grain": 2}, 2, 10.0),
-    "bread": ({"flour": 2}, 3, 12.0),
-    "tools": ({"wood": 3}, 1, 15.0),
-}
-NEEDS = {"bread": 0.0025, "fish": 0.0015, "tools": 0.0004}  # per resident per second
+# per resident per second, supply happiness (luxury bonus), undersupply happiness (penalty)
+NEEDS = {"bread": (0.0025, 0.0, -0.35), "fish": (0.0015, 0.0, -0.2), "tools": (0.0004, 0.15, 0.0)}
 
-CITY_SETUP = [  # name, (x, y), population, buildings
-    ("Ashford", (0, 0), 60, ["grain", "grain", "flour", "bread"]),
-    ("Brindle", (40, 10), 50, ["wood", "wood", "tools", "fish"]),
-    ("Corran", (15, 45), 45, ["fish", "fish", "grain", "flour"]),
-    ("Dunmere", (55, 50), 55, ["wood", "bread", "tools"]),
+CITY_SETUP = [  # name, (x, y), residents, housing capacity, buildings
+    ("Ashford", (0, 0), 30, 60, ["grain", "grain", "flour", "bread"]),
+    ("Brindle", (40, 10), 30, 50, ["wood", "wood", "tools", "fish"]),
+    ("Corran", (15, 45), 30, 45, ["fish", "fish", "grain", "flour"]),
+    ("Dunmere", (55, 50), 25, 55, ["wood", "bread", "tools"]),
 ]
-GUILDS = [("Red Hand", 3), ("Silver Wheel", 3)]
+GUILD_NAMES = ["Red Hand", "Silver Wheel", "Gilded Oar", "Iron Scale"]
+START_GUILDS = [("Red Hand", "Ashford"), ("Silver Wheel", "Brindle")]
 
 
-def theoretical_values():
-    """Cost-of-production valuation over the recipe graph (PricingPrediction)."""
-    val = {g: v for g, v in GOODS.items() if v is not None}
-    for _ in range(len(GOODS)):
-        for good, (inputs, out_qty, _) in RECIPES.items():
-            if good in val or not all(i in val for i in inputs):
-                continue
-            val[good] = 1.25 * sum(val[i] * q for i, q in inputs.items()) / out_qty
+def recipe_values(seed, old=None):
+    """PricingPrediction: value = (sum of input amount x input value + labour x seed) / output amount.
+    Labour (inhabitants) is the only base input and is worth `seed`. Each pass moves a value by at
+    most THEO_MAX_STEP; passes stop once every relative change is below THEO_TOL."""
+    val = dict(old) if old else {g: 1.0 for g in GOODS}
+    for _ in range(THEO_PASSES):
+        done = True
+        for good, (inputs, out_qty, _, labour) in RECIPES.items():
+            new = (sum(val[i] * q for i, q in inputs.items()) + labour * seed) / out_qty
+            if math.isnan(new) or new <= 0:
+                new = THEO_FLOOR
+            prev = val[good]
+            rel = (new - prev) / prev
+            if abs(rel) > THEO_TOL:
+                done = False
+                if abs(rel) > THEO_MAX_STEP:
+                    new = prev * (1 + math.copysign(THEO_MAX_STEP, rel))
+            val[good] = new
+        if done:
+            break
     return val
 
 
@@ -119,13 +146,15 @@ class Building:
     output: str
     progress: float = 0.0
     running: bool = False
+    workers: int = 0
 
 
 @dataclass
 class City:
     name: str
     pos: tuple
-    population: float
+    residents: int
+    capacity: int                # housing slots
     buildings: list
     cash: float = CITY_START_BUDGET
     tax_income: float = 0.0
@@ -133,8 +162,12 @@ class City:
     income_rate: float = 0.0
     spend_rate: float = 0.0
     new_port_timer: float = NEW_PORT_BONUS_T
-    satisfaction: float = 1.0
+    happiness: float = BASE_HAPPINESS        # average over residents
+    target_happiness: float = BASE_HAPPINESS
+    satisfaction: dict = field(default_factory=dict)   # per need: share of demand met
     consume_acc: dict = field(default_factory=dict)
+    pay_timer: float = 0.0
+    employed: int = 0
 
     def dist(self, other):
         return math.dist(self.pos, other.pos)
@@ -157,72 +190,130 @@ class Trader:
 @dataclass
 class Guild:
     name: str
-    cash: float = 600.0
+    cash: float = 0.0
     traders: list = field(default_factory=list)
+    branches: dict = field(default_factory=dict)   # city name -> prepaid lease credit
     earned: float = 0.0
+    branch_timer: float = 0.0                      # FoundNewBranchTimer
+    route_profit: dict = field(default_factory=dict)  # (src, dst) -> total gross profit
 
 
 class Economy:
     def __init__(self, seed=1):
         self.rng = random.Random(seed)
         self.t = 0.0
-        self.theo = theoretical_values()
+        self.seed_value, self.seed_delta = 1.0, 0.1    # TheoreticalMarketSeedValue / its step
+        self.theo = recipe_values(self.seed_value)
+        for _ in range(200):                           # settle the solver before the first tick
+            self.theo = recipe_values(self.seed_value, self.theo)
         self.mean = dict(self.theo)          # MeanMarketPrice
         self.glob = dict(self.theo)          # GlobalMarketPrice
         self.cities = []
-        for name, pos, pop, bld in CITY_SETUP:
-            c = City(name, pos, pop, [Building(b) for b in bld])
+        for name, pos, res, cap, bld in CITY_SETUP:
+            c = City(name, pos, res, cap, [Building(b) for b in bld])
             for g in GOODS:
                 c.storage[g] = Storage(g, amount=self.rng.randint(10, 40))
                 c.consume_acc[g] = 0.0
+            c.satisfaction = {g: 1.0 for g in NEEDS}
             self.cities.append(c)
         self.guilds = []
-        for gname, n in GUILDS:
-            gd = Guild(gname)
-            for i in range(n):
-                gd.traders.append(Trader(gd, self.cities[i % len(self.cities)]))
-            self.guilds.append(gd)
+        self.founding_timer = GUILD_FOUNDING_TIMEOUT
+        for gname, cname in START_GUILDS:
+            self.found_guild(gname, self.city(cname))
         self.log = []
 
+    def city(self, name):
+        return next(c for c in self.cities if c.name == name)
+
     # ---------------------------------------------------------- production
-    def produce_and_consume(self, dt):
+    def produce(self, dt):
+        """Productivity = staffed share of a building's worker slots. Inputs are taken when a
+        cycle starts; progress advances by dt / cycle time x productivity; output lands at 1.0."""
         for c in self.cities:
+            free = c.residents
             for b in c.buildings:
-                inputs, out_qty, secs = RECIPES[b.output]
+                b.workers = min(WORKERS_PER_BUILDING, free)
+                free -= b.workers
+            c.employed = c.residents - free
+            for b in c.buildings:
+                inputs, out_qty, secs, _ = RECIPES[b.output]
                 st_out = c.storage[b.output]
                 if not b.running:
-                    if all(c.storage[i].amount >= q for i, q in inputs.items()) and \
-                            st_out.amount + out_qty <= st_out.max_amount:
+                    if all(c.storage[i].amount >= q for i, q in inputs.items()):
                         for i, q in inputs.items():
                             c.storage[i].amount -= q
                             c.storage[i].flow_acc -= q
                         b.running, b.progress = True, 0.0
-                if b.running:
-                    b.progress += dt
-                    if b.progress >= secs:
-                        st_out.amount = min(st_out.max_amount, st_out.amount + out_qty)
-                        st_out.flow_acc += out_qty
-                        b.running = False
-            # residents
-            got, want = 0, 0
-            for g, rate in NEEDS.items():
-                c.consume_acc[g] += rate * c.population * dt
+                if b.running and b.progress < 1.0:
+                    b.progress += dt / secs * (b.workers / WORKERS_PER_BUILDING)
+                if b.running and b.progress >= 1.0 and st_out.amount + out_qty <= st_out.max_amount:
+                    st_out.amount += out_qty          # blocked while the output storage is full
+                    st_out.flow_acc += out_qty
+                    b.running = False
+
+    # ---------------------------------------------------------- residents
+    def residents(self, dt):
+        for c in self.cities:
+            # consumption: each need draws demand x dt; satisfaction = share of that demand met
+            for g, (rate, _, _) in NEEDS.items():
+                c.consume_acc[g] += rate * c.residents * dt
                 n = int(c.consume_acc[g])
                 if n:
                     take = min(n, c.storage[g].amount)
                     c.storage[g].amount -= take
                     c.storage[g].flow_acc -= take
                     c.consume_acc[g] -= n
-                    got, want = got + take, want + n
-            c.cash += RESIDENT_INCOME * c.population * dt
-            c.income_rate += RESIDENT_INCOME * c.population * dt
-            if want:
-                c.satisfaction += (got / want - c.satisfaction) * min(1.0, want * 0.05)
-            # population: move in when supplied, out when not (scaled MaxMove probs)
-            if self.rng.random() < MOVE_PROB * dt * max(0.0, c.satisfaction - 0.8) * 0.5:
-                c.population += 1
-            if self.rng.random() < MOVE_PROB * dt * max(0.0, 0.6 - c.satisfaction) * 0.5:
-                c.population = max(5, c.population - 1)
+                    c.satisfaction[g] = take / n
+            # target happiness: base + per need (satisfaction x supply bonus, or
+            # shortfall x undersupply penalty) + job / unemployment share
+            target = BASE_HAPPINESS
+            for g, (_, supply_h, under_h) in NEEDS.items():
+                s = c.satisfaction[g]
+                if s > 0 and supply_h:
+                    target += s * supply_h
+                elif under_h and s < 1:
+                    target += (1 - s) * under_h
+            if c.residents:
+                emp = c.employed / c.residents
+                target += emp * JOB_HAPPINESS + (1 - emp) * UNEMPLOYED_HAPPINESS
+            c.target_happiness = max(0.0, min(1.0, target))
+            # happiness eases toward the target: step = dt x speed x max(|gap|, 0.1)
+            gap = c.target_happiness - c.happiness
+            step = dt * HAPPINESS_SPEED * max(abs(gap), 0.1)
+            c.happiness = c.target_happiness if abs(gap) <= step else c.happiness + math.copysign(step, gap)
+            self.migrate(c, dt)
+            # coin payment every PAY_INTERVAL: residents x (base + happiness factor x bonus)
+            c.pay_timer += dt
+            if c.pay_timer >= PAY_INTERVAL:
+                c.pay_timer -= PAY_INTERVAL
+                hf = max(0.0, (c.happiness - CRITICAL_HAPPINESS) / (1 - CRITICAL_HAPPINESS))
+                pay = PAY_INTERVAL * c.residents * (BASE_PAY + hf * BONUS_PAY)
+                c.cash += pay
+                c.income_rate += pay
+
+    def migrate(self, c, dt):
+        """Compare happiness (relative to the critical level) with housing occupancy.
+        Happier than the occupancy -> chance to fill an empty slot; less happy -> chance to leave.
+        Each candidate slot rolls against (1 - rate)^dt; the first success moves one resident."""
+        if c.capacity <= 0:
+            return
+        occ = c.residents / c.capacity
+        h = max(0.0, min(1.0, c.happiness / CRITICAL_HAPPINESS))
+        if h >= occ:
+            if occ < 1:
+                stay = (1 - (h - occ) / (1 - occ) * MAX_MOVE_PROB) ** dt
+                for _ in range(c.capacity - c.residents):
+                    if self.rng.random() > stay:
+                        c.residents += 1
+                        break
+        else:
+            h2 = max(0.0, min(1.0, max(c.target_happiness, c.happiness) / CRITICAL_HAPPINESS))
+            if h2 < occ:
+                stay = (1 - (occ - h2) / occ * MAX_MOVE_PROB) ** dt
+                for _ in range(c.residents):
+                    if self.rng.random() > stay:
+                        c.residents -= 1
+                        break
 
     def local_values(self):
         """Local value of a good: what it is worth to this city's producers/consumers."""
@@ -231,7 +322,7 @@ class Economy:
             for g, st in c.storage.items():
                 v = self.theo[g]
                 if g in made_here:
-                    inputs, out_qty, _ = RECIPES[g]
+                    inputs, out_qty, _, _ = RECIPES[g]
                     v = sum(c.storage[i].buy_price if c.storage[i].buy_price > 0 else self.glob[i]
                             for i, q in inputs.items() for _ in range(q)) / out_qty if inputs else v * 0.8
                 st.local_value = max(MIN_PRICE, v)
@@ -312,7 +403,16 @@ class Economy:
         volume = {g: sum(c.storage[g].amount for c in self.cities) for g in GOODS}
         total_volume = sum(volume.values())
         goods_value = sum(volume[g] * self.glob[g] for g in GOODS)
-        cash = sum(c.cash for c in self.cities) + sum(gd.cash for gd in self.guilds)
+        cash = sum(c.cash for c in self.cities)   # the "cities" budget total
+        # Theoretical seed (value of labour): an adaptive step that grows 10% while the error keeps
+        # its sign and flips at 90% when it changes, until cash ~ DESIRED_CASH_TO_GOODS x theo value.
+        theo_value = sum(volume[g] * self.theo[g] for g in GOODS)
+        err = cash - DESIRED_CASH_TO_GOODS * theo_value
+        if err != 0:
+            same = (err > 0) == (self.seed_delta > 0)
+            self.seed_delta *= 1.1 if same else -0.9
+            self.seed_value = max(0.01, self.seed_value + self.seed_delta * dt)
+        self.theo = recipe_values(self.seed_value, self.theo)
         money_dev = (cash - DESIRED_CASH_TO_GOODS * goods_value) / cash if cash > 0 else 0.0
         self.money_dev = money_dev
         for g in GOODS:
@@ -446,31 +546,114 @@ class Economy:
                         tr.budget += price * qty
                         profit += (price - paid) * qty   # unsold units are written off
                     gd.earned += profit
+                    key = (tr.route[0].name, dst.name)
+                    gd.route_profit[key] = gd.route_profit.get(key, 0.0) + profit
                     tr.profit_avg += (profit - tr.profit_avg) * 0.2
                     tr.cargo, tr.task, tr.city = [], "idle", dst
                     # surplus trader cash flows back to the guild bank
                     if tr.budget > TRADER_BUDGET_KEEP:
                         gd.cash += tr.budget - TRADER_BUDGET_KEEP
                         tr.budget = TRADER_BUDGET_KEEP
-            # guild expansion / contraction
-            reserve = MONEY_RESERVE_TIME * 1.0 * len(gd.traders)
-            if gd.cash > reserve + NEW_TRADER_COST * 2 and len(gd.traders) < 12:
-                avg = sum(t.profit_avg for t in gd.traders) / len(gd.traders)
-                if avg > MIN_PROFIT * 5:
-                    gd.cash -= NEW_TRADER_COST
-                    gd.traders.append(Trader(gd, self.rng.choice(self.cities)))
-            elif gd.cash < 0 and len(gd.traders) > 1:
-                gd.traders.pop()
-                gd.cash += NEW_TRADER_COST * 0.5
+
+    # ---------------------------------------------------------- guilds
+    def found_guild(self, name, port):
+        """The founding port pays NEW_GUILD_COST (or what it has) into the new guild's account;
+        the guild then opens its first branch there."""
+        pay = min(NEW_GUILD_COST, port.cash)
+        port.cash -= pay
+        gd = Guild(name, cash=pay)
+        self.guilds.append(gd)
+        self.founding_timer = GUILD_FOUNDING_TIMEOUT
+        self.open_branch(gd, port)
+        return gd
+
+    def can_afford_branch(self, gd):
+        """GuildCanAffordNewBranch: cooldown over and cost + prepaid lease < account - reserve."""
+        reserve = MONEY_RESERVE_TIME * BRANCH_LEASE * len(gd.branches)
+        return gd.branch_timer <= 0 and BRANCH_COST + BRANCH_LEASE * INCLUDED_LEASE_TIME < gd.cash - reserve
+
+    def open_branch(self, gd, port):
+        """Pay for the branch with its prepaid lease, start the cooldown, and spawn one trader there.
+        In the game the trader takes the guild route through this port with the highest gross profit."""
+        cost = BRANCH_COST + BRANCH_LEASE * INCLUDED_LEASE_TIME
+        if gd.cash < cost:
+            return False
+        gd.cash -= cost
+        port.cash += BRANCH_COST
+        gd.branches[port.name] = BRANCH_LEASE * INCLUDED_LEASE_TIME
+        gd.branch_timer += FOUND_BRANCH_TIMEOUT
+        gd.traders.append(Trader(gd, port))
+        return True
+
+    def scrap(self, gd, tr):
+        gd.cash += tr.budget
+        tr.budget = 0.0
+        gd.traders.remove(tr)
+
+    def run_guilds(self, dt):
+        for gd in list(self.guilds):
+            gd.branch_timer = max(0.0, gd.branch_timer - dt)
+            # branch lease: prepaid credit first, then the guild account
+            short = []
+            for cname in gd.branches:
+                due = BRANCH_LEASE * dt
+                from_credit = min(due, gd.branches[cname])
+                gd.branches[cname] -= from_credit
+                paid = from_credit + min(due - from_credit, max(0.0, gd.cash))
+                gd.cash -= paid - from_credit
+                self.city(cname).cash += paid
+                if due > paid:
+                    short.append((cname, due - paid))
+            owed = sum(a for _, a in short)
+            if owed > 0:
+                # short: pull cash back from traders; every trader drained this way is scrapped
+                for tr in list(gd.traders):
+                    if gd.cash >= owed:
+                        break
+                    if tr.budget > 0:
+                        self.scrap(gd, tr)
+                for cname, amount in short:
+                    pay = min(amount, max(0.0, gd.cash))
+                    gd.cash -= pay
+                    self.city(cname).cash += pay
+                    owed -= pay
+                if owed > 1e-9:   # still short: the guild dissolves
+                    for tr in list(gd.traders):
+                        self.scrap(gd, tr)
+                    self.guilds.remove(gd)
+                    self.founding_timer = GUILD_FOUNDING_TIMEOUT * (0.1 if not self.guilds else 1.0)
+                    continue
+            # stand-in for the Blueprint-side expansion decision: open a branch in the city
+            # (without one) that the guild's best-earning route touches, else the nearest city
+            if self.can_afford_branch(gd):
+                missing = [c for c in self.cities if c.name not in gd.branches]
+                if missing:
+                    best = max(gd.route_profit.items(), key=lambda kv: kv[1], default=None)
+                    pick = next((c for c in missing if best and c.name in best[0]), None)
+                    if pick is None:
+                        home = self.city(next(iter(gd.branches)))
+                        pick = min(missing, key=home.dist)
+                    self.open_branch(gd, pick)
+        # stand-in for Blueprint-side guild founding: after the cooldown the richest port founds one
+        self.founding_timer -= dt
+        if self.founding_timer <= 0 and len(self.guilds) < MAX_GUILDS:
+            names = [n for n in GUILD_NAMES if n not in {g.name for g in self.guilds}]
+            port = max(self.cities, key=lambda c: c.cash)
+            if names and port.cash > 2 * NEW_GUILD_COST:
+                self.found_guild(names[0], port)
+            else:
+                self.founding_timer = GUILD_FOUNDING_TIMEOUT
 
     # ---------------------------------------------------------- loop
     def step(self, dt=TICK):
         self.t += dt
-        self.produce_and_consume(dt)
+        self.produce(dt)
+        self.residents(dt)
         self.local_values()
         self.price_ports(dt)
         self.update_global_prices(dt)
         self.run_traders(dt)
+        self.run_guilds(dt)
         for c in self.cities:          # decay flow-rate accumulators (~60 s window)
             c.income_rate *= 1 - dt / 60
             c.spend_rate *= 1 - dt / 60
@@ -481,10 +664,13 @@ class Economy:
             row[f"glob_{g}"] = round(self.glob[g], 2)
         for c in self.cities:
             row[f"{c.name}_cash"] = round(c.cash)
-            row[f"{c.name}_pop"] = round(c.population)
-        for gd in self.guilds:
-            row[f"{gd.name}_cash"] = round(gd.cash)
-            row[f"{gd.name}_traders"] = len(gd.traders)
+            row[f"{c.name}_pop"] = c.residents
+            row[f"{c.name}_happy"] = round(c.happiness, 3)
+        row["theo_seed"] = round(self.seed_value, 3)
+        for name in GUILD_NAMES:
+            gd = next((g for g in self.guilds if g.name == name), None)
+            row[f"{name}_cash"] = round(gd.cash) if gd else ""
+            row[f"{name}_traders"] = len(gd.traders) if gd else 0
         return row
 
     def report(self):
@@ -499,10 +685,12 @@ class Economy:
                 cells.append(f"{st.amount:3d} {side} {p:6.2f} p{st.priority:.2f}")
             print(f"{g:7s} {self.theo[g]:5.2f} {self.glob[g]:7.2f}  " + "  ".join(cells))
         print("cities: " + "  ".join(
-            f"{c.name}: cash {c.cash:7.0f} tax {c.tax_income:6.0f} pop {c.population:4.0f} sat {c.satisfaction:.2f}"
-            for c in self.cities))
+            f"{c.name}: cash {c.cash:7.0f} tax {c.tax_income:6.0f} pop {c.residents:3d}/{c.capacity} "
+            f"happy {c.happiness:.2f}" for c in self.cities))
+        print(f"labour seed {self.seed_value:.3f}")
         print("guilds: " + "  ".join(
-            f"{g.name}: cash {g.cash:7.0f} traders {len(g.traders)} profit {g.earned:7.0f}" for g in self.guilds))
+            f"{g.name}: cash {g.cash:7.0f} traders {len(g.traders)} branches {len(g.branches)} "
+            f"profit {g.earned:7.0f}" for g in self.guilds))
 
 
 def main():

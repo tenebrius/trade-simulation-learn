@@ -7,6 +7,7 @@ Confidence tags:
 - **[code]** read directly from decompiled logic
 - **[defaults]** constant values recovered from C++ constructors; a cooked data asset may override them
 - **[struct]** inferred from field names and types in the reflection data, with no formula confirmed yet
+- **[blueprint]** native code exposes the operation but never calls it itself, so the decision is made in Blueprint script inside the cooked content (not decoded yet)
 
 ---
 
@@ -28,7 +29,7 @@ Goods never move between buildings and other cities directly. Everything goes th
 For each good, `FGlobalResourceData` holds:
 - `MeanMarketPrice`: the reference that port price bands are built around **[code]**
 - `GlobalMarketPrice`: the slow-moving anchor that local prices are pulled toward **[code]**
-- `TheoreticalMarketPrice`: the recipe-based cost of production **[struct]**
+- `TheoreticalMarketPrice`: the recipe-based cost of production, see 2.1 **[code]**
 - volumes (offered, asked, reserved, in transit, in stock), supply and demand rates (theoretical maximum, optimal, current), and histories
 
 Market totals are recomputed as the sum over goods of (stock + in transit) × price, separately for the mean, global and theoretical prices **[code]**.
@@ -38,14 +39,31 @@ The global layer runs as a fixed sequence of steps inside the economy subsystem'
 1. **Mean price** = volume-weighted average of all open **buy** market orders for the good: Σ(amount × price per unit) / Σ amount. The value is only replaced when such orders exist.
 2. **Market totals**: the current, global and theoretical market values are recomputed as above.
 3. **Global price drift**, once per tick for each good:
-   - `money_dev = (C − 2.0 × TotalGlobalMarketValue) / C`, where C is a global coin quantity read from the economy registry (most likely the coins in circulation) and 2.0 is `DesiredCashVolumeToGoodsValue`. The result is stored as `RelativeMoneyVolumeToMarketValueDeviation`.
+   - `money_dev = (C − 2.0 × TotalGlobalMarketValue) / C`, where C is the total coin budget of all cities (the "cities" element of the subsystem's budget tree, under "root") and 2.0 is `DesiredCashVolumeToGoodsValue`. The result is stored as `RelativeMoneyVolumeToMarketValueDeviation`.
    - `global += (mean − global) × 0.01 × dt`, with 0.01 = `MeanToGlobalPriceWeightPerSec`.
    - `global += (theoretical − global) × 0.002 × dt`, with 0.002 = `TheoreticalToGlobalPriceWeightPerSec`.
    - `global += min(0.05, good_volume / total_volume) × global × dt × 0.05 × money_dev`. Here 0.05 = `RelativeMoneyVolumeToMarketWeightPerSec` and `MinimumGoodVolumeWeightPercentage` acts as a *cap*. Too much money relative to goods inflates prices; too little deflates them; goods that make up more of the market react more.
    - Global floor is 0.1, and NaN is reset to 0.1.
    - Unless a per-good flag is set, the mean is then **overwritten with the new global**. Ports therefore price against a reference that moves only at these slow rates, which is what keeps the band-based controller in section 3 from feeding back on itself.
 
-`MaxGlobalRelativePriceChangePerSec` (0.00033) is not used here. The port controller uses it as an absolute cap on each price step: that same registry quantity × 0.00033 × dt.
+`MaxGlobalRelativePriceChangePerSec` (0.00033) is not used here. The port controller uses it as an absolute cap on each price step: the cities' coin total C × 0.00033 × dt.
+
+### 2.1 Theoretical price: labour-seeded cost of production [code]
+
+`UPricingPrediction` values every good from its recipe:
+
+  value(good) = (ConstantCost + Σ input amount × value(input)) / output amount
+
+The recipe graph bottoms out in **inhabitants** (`inhabitant_lvl_1` … `inhabitant_lvl_4`): labour is the only base input. All four levels are valued at one number, `TheoreticalMarketSeedValue`. Goods marked as *held* keep a fixed value. A NaN or non-positive result falls back to 0.01.
+
+The solver runs up to 10 passes per update. In each pass a value may change by at most 1% of its previous value. It stops early once every relative change is below 0.1%. So theoretical prices follow the recipes smoothly rather than jumping.
+
+**The seed is a money-supply controller.** Each economy tick:
+- error = C − 2.0 × `TotalTheoreticalMarketValue`, with C the cities' coin total from above.
+- The step `CachedTheoreticalMarketSeedDeltaValue` is multiplied by 1.1 while the error has the same sign as the step. When the sign differs it is multiplied by −0.9, which reverses it.
+- seed += step, with a floor of 0.01.
+
+This is a sign-based adaptive step, similar to Rprop. When cities hold more coins than twice the theoretical value of all goods, labour becomes worth more. That raises every theoretical price, which then pulls the global prices up at 0.002/s. Coin creation by residents (section 6) therefore turns into price inflation through two separate channels: the money_dev term above, and this seed.
 
 ## 3. Port pricing: the core loop [code]
 
@@ -139,7 +157,7 @@ So a port running out of money automatically lowers buy prices and sells harder.
 ## 5. Guilds and traders
 
 ### 5.1 Orders: how goods get matched [code + struct]
-Ports don't talk to traders directly. Each port posts **market orders** (`FMarketOrder`: good, amount, price per unit, buy or sell) with the economy subsystem. Volumes come from section 3.1 and prices from section 3.4. A **transport order** (`FTransportOrder`) pairs a source port's sell order with a target port's buy order. It records the amount, the sell price per unit (what the trader pays), the buy price per unit (what the trader receives) and the profit per unit. That the profit per unit is buy minus sell is inferred from the field names. When a trader commits to a load it reserves the orders as a `FTransportContract`, which also records taxes and subsidies for both ends.
+Ports don't talk to traders directly. Each port posts **market orders** (`FMarketOrder`: good, amount, price per unit, buy or sell) with the economy subsystem. Volumes come from section 3.1 and prices from section 3.4. A **transport order** (`FTransportOrder`) pairs a source port's sell order with a target port's buy order. It records the amount, the sell price per unit (what the trader pays), the buy price per unit (what the trader receives) and the profit per unit. **[code]**: profit per unit = the target's buy price − the source's sell price, and the amount = the smaller of the two orders' remaining amounts (each order's amount minus what is already reserved or in transit). When a trader commits to a load it reserves the orders as a `FTransportContract`, which also records taxes and subsidies for both ends.
 
 ### 5.2 Route choice [code]
 - **Filling the wagon**: to value a candidate route, the trader greedily fills its capacity from that route's transport orders. At each step it takes the order with the largest min(order amount, remaining capacity) × profit per unit, then repeats with the remaining capacity. Wagons therefore carry **mixed goods**. Port subsidies are added to the value, capped by what the port can still pay out.
@@ -149,33 +167,60 @@ Ports don't talk to traders directly. Each port posts **market orders** (`FMarke
 ### 5.3 Trader cash [code]
 Each trader carries its own cash (`TraderStats.Budget`). If the planned purchase costs more than the budget, the trader asks its guild for the gap. If that's refused it asks for half, then for a quarter. The guild approves a request only if **account − emergency reserve > requested amount**; the cash then moves from the guild bank into the trader's budget. The trader tick is a state machine over `ETraderTask`: move to route, trading, collect maintenance resources, maintenance, resupply, move to scrap, scrap.
 
-### 5.4 Guild strategy [struct + defaults], formulas still to be confirmed
+### 5.4 Guild life cycle: founding, branches, hiring, firing
+
+**What native code does [code]:**
+- **Founding a guild.** The founding function refuses once `MaxSimultaneousFreeTradeGuilds` (5) guilds exist. The new guild's opening account is funded either by the port it starts in (from the port's cash) or from a caller-supplied amount, capped by what the payer holds. Starting a guild also restarts the association's founding cooldown (`GuildFoundingTimer += GuildFoundingTimeOut`). Character traits come from the guild's style, or are four independent uniform random numbers in [0, 1] when the style has none.
+- **Can the guild afford a branch?** Three conditions must hold: the branch cooldown is exactly 0, the guild's trader type has a known price, and **wagon price + `DefaultBranchLease` x `IncludedFoundingLeaseTime` < account - money reserve**. With defaults that is wagon price + 0.1 x 120.
+- **Opening a branch.** The port rejects the branch once it holds `MaxNumTradeGuildBranches` (6) branches. It then takes a market slot and settles the lease credit, either from its own funds or from the credit passed in. The branch registers with its guild, which **adds `FoundNewBranchTimeOut` (60 s) to the branch cooldown** and immediately **spawns one trader**. That trader is assigned to the guild route through this port with the highest *total gross profit*.
+- **Leases.** Every tick a branch owes the port lease x dt. It pays from its prepaid `BranchCredit` first, then from the guild account. When paid in full, the cost is booked against the branch's routes in equal shares, as negative transfers in route accounting.
+- **Firing traders.** Scrapping is triggered in only one way: the guild cannot pay a lease. The guild then walks its traders and pulls each one's whole cash budget back into the account until the shortfall is covered. **Every trader drained this way is scrapped.** One with a home branch drives there first (`MoveToScrap`), returns any cash, then is removed. Profit-based culling does not exist anywhere in native code.
+- **Bankruptcy.** If the lease still can't be paid after recalling trader cash, the guild dissolves. All traders are scrapped, all branches closed, and any remaining account goes to the **player's** budget. The guild is removed, and the founding cooldown resets to `GuildFoundingTimeOut`, or to 10% of it when no guild is left, so a replacement appears quickly.
+- **Reassignment.** When routes change, a guild re-assigns traders to its highest-gross-profit route.
+- **Trader cash requests** (5.3): granted only if account - emergency reserve > amount.
+
+**What is decided in Blueprints [blueprint]:**
+- *When* to found a guild, *where* to open a branch, and *when* to spawn extra traders. `TryFoundTradeGuildInTargetPort`, `GuildCanAffordNewBranch` and `TrySpawnTraderForTradeGuildBranch` are Blueprint-callable, and no native code calls them.
+- The countdown of both cooldowns (`FoundNewBranchTimer`, `GuildFoundingTimer`). Native code only adds to them and checks them.
+- How the character traits and `FTradeGuildCharacterRelatedConstants` are applied. Native code sets the traits at founding, but no native float arithmetic reads them through the guild or applies those constants.
+- `EstimatedAdditionalProfitPerTraderPerSec` on routes is never written by native code.
+
+The UI hints that these decisions are partly the player's: there are cards to found branches and guilds, and a branch-purchase popup. Reading the actual rules needs the cooked Blueprints unpacked from the IoStore container (`.utoc`/`.ucas`, Oodle-compressed).
 
 Guild constants **[defaults]**:
-- New guild costs 500; a new branch costs 200 (founding cost factor 2.0, gain bonus 10×, first founding 20×).
-- At most 5 free guilds and 6 branches per port; branch lease 0.01 (port) or 0.1 (guild).
-- A branch stores 5 units and buys when at least 40% of storage is free; critical utilization is 0.9.
+- New guild costs 500; a branch costs 200 (founding cost factor 2.0, gain bonus 10x, first founding 20x).
+- At most 5 free guilds and 6 branches per port. Branch lease is 0.01 (port setting) or 0.1 (guild setting), with 120 s of lease included on founding.
+- Branch cooldown 60 s. A branch stores 5 units and buys when at least 40% of storage is free; critical utilization 0.9.
 - **A trade must earn at least 1 coin to be considered.** Traders are repriced every 10 s and may switch route every 30 s; a route is reviewed against a 180 s window.
-- Money reserve = 60 s of expenses; trader capacity reserve factor 2.0.
+- Money reserve time 60 s; trader capacity reserve factor 2.0.
 
-Character traits greed, precaution and competitiveness (weights ±10) drive:
-- the maximum cash change per second;
-- the usable range;
-- extra precaution when the balance is negative;
-- a competition malus and an expansion bonus on profit weighting;
-- a bonus or malus to the money reserve when hiring new traders.
+Trader constants **[defaults]**: profit and utilization are averaged over 30 s, max profit deviation is 0.5, repair speed is 100, and wagons wear per second and consume maintenance resources. `ETraderTask` values: Trading 0, MoveToTradeRoute 1, MoveToMaintenance 2, CollectingMaintenanceResources 3, Maintenance 4, MoveToResupply 5, Resupply 6, MoveToScrap 7, ScrapTrader 8.
 
-Trader constants **[defaults]**: profit and utilization are averaged over 30 s, max profit deviation is 0.5, repair speed is 100, and wagons wear per second and consume maintenance resources.
+## 6. City side
 
-Routes (`FTradeRouteRevenue` / `FTradeGuildTradeRoute`) track gross profit, investment, distance, volume, serving traders per guild, cheapest guild, and estimated additional profit per extra trader per second. This is the per-route marginal-value test used to decide whether to add a trader. Route coverage states: has unused potential, has unused potential for an existing trader, overcrowded, balanced.
+### 6.1 Production [code]
+Each production building's tick:
+- **Productivity** = filled worker slots / worker slots. It is 1 when the building needs no workers and 0, blocked, when no slot is filled.
+- A cycle **starts** when it isn't blocked by missing inputs. Inputs are deducted **at the start** and progress resets to 0.
+- **Progress** += dt / `SecondsPerCycle` x productivity. At 1.0 the cycle finishes, delivering outputs if there is room, and the next one tries to start immediately.
+- Each input slot orders a refill from the city whenever it has whole units of free capacity.
+- `FProductionSpecs` also defines coin output per cycle and boosters **[struct]**. Defaults: minimum input stock 5, minimum output space 10, fill and empty times 120 s **[defaults]**.
 
-## 6. City side [struct + defaults]
+### 6.2 Residents: consumption, happiness, income, migration [code]
+Housing tiles (`UResidentialTileComponent`) run these steps every economy tick, in this order:
+1. **Restock**: a consumer slot orders from the city when its free capacity (whole units) is more than `MinFreeConsumerCapacityFractionToOrder` (5%) of capacity.
+2. **Migration**: see below.
+3. **Consumption**: each consumer slot draws `ConsumePerSecond` x dt from its local stock. *Satisfaction* = the share of that draw actually available: 1 if fully met, stock / need if partly met, 0 if empty.
+4. **Happiness**: each resident has a target built from their type's base happiness, plus the building's bonus, plus job or unemployment happiness. Each consumed good then adds satisfaction x `SupplyHappiness` when that is non-zero, or else (1 - satisfaction) x `UndersupplyHappiness` (a penalty). The target is clamped to [0, 1]. Happiness moves toward it by at most dt x `MaxRelativeHappinessChangeSpeed` (0.01) x max(|gap|, 0.1) per tick. The house's average happiness is the mean over its residents.
+5. **Income**: every `ResidenceCoinPayInterval`, each resident pays interval x (`BasePaymentPerSec` + f x `MaxBonusPaymentPerSec`) into the city. Here f = max(0, (avg - critical) / (1 - critical)). A multiplicative building bonus applies. Both payments default to 1.0/s per inhabitant in C++. **Residents are the source of new coins**, and that is what drives the money terms in section 2.
 
-- Consumers: residents, castle, industry. Each has consumption per second with additive and multiplicative modifiers.
-- Supply quality drives happiness and migration: up to 10%/s probability of moving in or out.
-- Producers: `FProductionSpecs` gives seconds per cycle, inputs, outputs, coin output per cycle and boosters. Minimum input stock is 5, minimum output space is 10, with fill and empty times of 120 s.
-- City transporters: 5 units each, speed 0.3, load time 0.5–3 s. Their queue priority weights wait time (1), city size (1) and storage fill (40).
-- Construction materials get priority weight 0.8 and basic needs 0.4.
+**Migration**: let occupancy f = residents / slots and h = clamp(avg happiness / critical happiness, 0, 1).
+- If h >= f: rate = (h - f) / (1 - f) x `MaxMoveInProbabilityPerSec`. Each empty slot rolls in turn; it is filled when a uniform random number exceeds (1 - rate)^dt. At most one person moves in per tick.
+- Otherwise, recompute h using max(target, average) happiness. If that is still below f: rate = (f - h) / f x `MaxMoveInProbabilityPerSec`, and occupied slots roll in the same way for at most one move-out per tick.
+- Quirk: both directions use **MaxMoveIn**. `MaxMoveOutProbabilityPerSec` is not read by this code.
+
+### 6.3 Logistics [defaults]
+City transporters carry 5 units at speed 0.3, with load times of 0.5-3 s. Their queue priority weights wait time (1), city size (1) and storage fill (40). Construction materials get priority weight 0.8 and basic needs 0.4.
 
 ## 7. Engine extras
 
@@ -189,16 +234,17 @@ Routes (`FTradeRouteRevenue` / `FTradeGuildTradeRoute`) track gross profit, inve
 4. **Buy/sell band shift.** Buying prices sit about 0.2 × mean above selling prices on average, which guarantees a trader margin, while distance and wagon upkeep decide which routes actually pay.
 5. **Cost-of-production anchor.** The theoretical price from the recipe graph keeps the global level tied to real production costs.
 6. **Liquidity feedback.** Broke ports stop bidding, so money and goods circulate instead of pooling.
+7. **Labour is the unit of value.** Residents create the coins, and the theoretical price of every good is a recipe-weighted amount of labour priced by one seed that tracks the coins in circulation. Inflation therefore follows population and happiness instead of being scripted.
+8. **Guilds die from cash flow, not from bad routes.** A guild only loses traders when it can't pay its branch leases. Unprofitable traders keep running until the money runs out, then get recalled one by one; if that isn't enough, the whole guild goes bankrupt.
 
 ---
 
 ### Simulation
-`ltt_sim.py` reimplements sections 2–4 and 5.1–5.3. It uses simplified stand-ins for the guild strategy (5.4) and the city side (section 6):
-- transport orders are built on the fly from port surpluses and shortfalls;
-- guilds hire when profitable and fire when broke;
-- the emergency reserve and the cash a trader keeps between trips are fixed values;
-- residents bring a fixed coin income;
-- migration based on satisfaction.
+`ltt_sim.py` reimplements sections 2 (including the labour-seeded theoretical prices), 3, 4, 5.1-5.3, the native parts of 5.4, and 6.1-6.2 (production, consumption, happiness, income, migration). Simplifications and stand-ins:
+- Transport orders are built on the fly from port surpluses and shortfalls.
+- Blueprint-side decisions use simple rules. A guild opens a branch whenever it can afford one, in the city its best-earning route touches. The richest port founds a new guild after the founding cooldown.
+- The emergency reserve, the cash a trader keeps between trips, the critical happiness (0.5), the pay interval (10 s) and the happiness weights are sim choices. Resident pay is scaled down to the sim's price level.
+- There is no player, so coins only enter through resident pay. Prices therefore inflate slowly through both money terms, as section 2 predicts.
 
 There are no bandits, knights, tiles, research or events. Run:
 
