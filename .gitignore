@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 *.csv
 .venv/
+node_modules/
+web/dist/
+web/dist-single/
