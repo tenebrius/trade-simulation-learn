@@ -1,6 +1,6 @@
 # Plan: browser simulation that explains itself
 
-Status: **v3 (final)**: draft v1 → self-review → v2 → independent review → v3 → final self-review (scope cuts at the end).
+Status: **v3 (final)**: draft v1 → self-review → v2 → independent review → v3 → final self-review (scope cuts at the end). Milestones 1–4 are implemented; see the README for how to run it.
 
 ## Goal
 

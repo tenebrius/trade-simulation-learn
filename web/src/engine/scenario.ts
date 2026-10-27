@@ -61,4 +61,6 @@ export interface Scenario {
   /** Road segments between city indices; empty = straight lines between every pair. */
   roads: { a: number; b: number; via?: [number, number][] }[];
   options: ScenarioOptions;
+  /** Decoration only: mountains and place names drawn on the map. */
+  features?: { kind: "mountain" | "label" | "water"; pos: [number, number]; text?: string; size?: number }[];
 }

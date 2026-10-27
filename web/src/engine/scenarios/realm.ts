@@ -121,6 +121,17 @@ export const realm: Scenario = {
     // the mountain pass: the only way to Highcairn, long and winding
     { a: 5, b: 6, via: [[90, 32], [80, 24], [86, 16], [72, 12]] },
   ],
+  features: [
+    { kind: "mountain", pos: [94, 24], size: 7 },
+    { kind: "mountain", pos: [76, 20], size: 6 },
+    { kind: "mountain", pos: [88, 8], size: 8 },
+    { kind: "mountain", pos: [50, 20], size: 6 },
+    { kind: "mountain", pos: [100, 14], size: 5 },
+    { kind: "label", pos: [97, 34], text: "Cairn Pass" },
+    { kind: "water", pos: [112, 104], size: 30 },
+    { kind: "label", pos: [102, 82], text: "Salt Sea" },
+    { kind: "label", pos: [8, 22], text: "Oak Wood" },
+  ],
   options: {
     quirks: false,
     transportCost: 0.04,

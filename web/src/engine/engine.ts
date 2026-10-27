@@ -575,10 +575,11 @@ export class Engine {
         if (st.announced <= 0) st.announced = now;
         else if (Math.abs(now / st.announced - 1) > 0.25) {
           const up = now > st.announced;
+          const move = Math.abs(now / st.announced - 1);
           this.emit(
             "price",
-            2,
-            `${this.sc.goods[g].name} in ${c.name} ${up ? "up" : "down"} ${pct(Math.abs(now / st.announced - 1))} to ${f2(now)} (${side === "buy" ? "buying" : "selling"}, stock ${st.amount}/${desired}).`,
+            move > 0.5 ? 2 : 3,
+            `${this.sc.goods[g].name} in ${c.name} ${up ? "up" : "down"} ${pct(move)} to ${f2(now)} (${side === "buy" ? "buying" : "selling"}, stock ${st.amount}/${desired}).`,
             { city: ci, good: g, key: `price-${ci}-${g}` },
           );
           st.announced = now;

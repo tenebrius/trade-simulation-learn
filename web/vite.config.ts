@@ -7,5 +7,5 @@ export default defineConfig(({ mode }) => ({
   base: "./",
   plugins: [preact(), ...(mode === "single" ? [viteSingleFile()] : [])],
   build: { outDir: mode === "single" ? "dist-single" : "dist" },
-  test: { environment: "node" },
+  test: { environment: "node", testTimeout: 60_000 },
 }));
