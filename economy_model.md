@@ -1,13 +1,12 @@
 # Let Them Trade: economy model (reverse-engineered)
 
 Source: static analysis of `LetThemTrade-Win64-Shipping.exe` (UE 5.5, CL 39378466, C++ game module).
-Method: recovered Unreal reflection tables (class, struct, field and offset data), C++ constructor defaults, and Ghidra decompilation of selected functions. This document describes the mechanics in my own words; it does not reproduce game code.
+Method: recovered Unreal reflection tables (class, struct, field and offset data), C++ constructor defaults, and Ghidra decompilation of selected functions. The cooked content (IoStore `.utoc`/`.ucas`) was unpacked with retoc and every asset searched for Blueprint calls into the economy. This document describes the mechanics in my own words; it does not reproduce game code.
 
 Confidence tags:
 - **[code]** read directly from decompiled logic
 - **[defaults]** constant values recovered from C++ constructors; a cooked data asset may override them
 - **[struct]** inferred from field names and types in the reflection data, with no formula confirmed yet
-- **[blueprint]** native code exposes the operation but never calls it itself, so the decision is made in Blueprint script inside the cooked content (not decoded yet)
 
 ---
 
@@ -17,8 +16,9 @@ Confidence tags:
 |---|---|---|
 | **Trade port** (`UTradePort`, one per city) | The city's single market interface. Holds storage and a cash bank, and quotes a buy price and a sell price per good. | `Storage[good]` (`FTradePortStorage`), `TradePortBank`, tax %, generosity setting |
 | **City** | Producers (production buildings) and consumers (residents, castle, industry). City transporters move goods between buildings and the port. | Population, consumer slots, storage size 100, start budget 1,000 |
-| **Trade guild** (`UTradeGuild`) | AI merchant companies. They open *branches* in ports, own *traders*, and pick *trade routes*. | Bank (account, reserve, emergency reserve), character (greed / precaution / competitiveness), branches, routes, subsidy |
-| **Trader** (`UTraderComponent`) | A wagon owned by a guild that hauls goods from a port that sells to a port that buys. | Capacity, wear and maintenance resources, profit and utilization averaged over 30 s |
+| **City buyer** (a `UTraderComponent` owned by a city) | The city's own wagons. They buy goods at other ports and bring them home. This is what carries trade in the shipped game (section 5.4). | 2 per city by default, plus research and card bonuses |
+| **Trade guild** (`UTradeGuild`) | Merchant companies that open *branches* in ports and own traders. Fully implemented in native code, but nothing in the shipped game founds one in a new game (section 5.5). | Bank (account, reserve, emergency reserve), character (greed / precaution / competitiveness), branches, routes, subsidy |
+| **Trader** (`UTraderComponent`) | A wagon that hauls goods from a port that sells to a port that buys. Its owner (`TraderAllegiance`) is a city or a guild. | Capacity, wear and maintenance resources, profit and utilization averaged over 30 s |
 | **Economy subsystem** (`UEconomyManagementSubsystem`) | Global market: per-good global, mean and theoretical prices, market orders, transport orders, route revenues. | `GlobalResourceData[good]`, market value totals |
 | **Pricing prediction** (`UPricingPrediction`) | Cost-of-production valuation over the recipe graph, giving the *theoretical* price. Not machine learning. | Default values, recipe dependencies and ratios, approximated values |
 
@@ -154,7 +154,7 @@ These feed back into pricing through two factors:
 
 So a port running out of money automatically lowers buy prices and sells harder.
 
-## 5. Guilds and traders
+## 5. Traders, city buyers and guilds
 
 ### 5.1 Orders: how goods get matched [code + struct]
 Ports don't talk to traders directly. Each port posts **market orders** (`FMarketOrder`: good, amount, price per unit, buy or sell) with the economy subsystem. Volumes come from section 3.1 and prices from section 3.4. A **transport order** (`FTransportOrder`) pairs a source port's sell order with a target port's buy order. It records the amount, the sell price per unit (what the trader pays), the buy price per unit (what the trader receives) and the profit per unit. **[code]**: profit per unit = the target's buy price − the source's sell price, and the amount = the smaller of the two orders' remaining amounts (each order's amount minus what is already reserved or in transit). When a trader commits to a load it reserves the orders as a `FTransportContract`, which also records taxes and subsidies for both ends.
@@ -165,9 +165,20 @@ Ports don't talk to traders directly. Each port posts **market orders** (`FMarke
 - **Utilization** = loaded amount ÷ capacity, stored as `CurrentTraderUtilizationFraction` and fed into the guild's route statistics.
 
 ### 5.3 Trader cash [code]
-Each trader carries its own cash (`TraderStats.Budget`). If the planned purchase costs more than the budget, the trader asks its guild for the gap. If that's refused it asks for half, then for a quarter. The guild approves a request only if **account − emergency reserve > requested amount**; the cash then moves from the guild bank into the trader's budget. The trader tick is a state machine over `ETraderTask`: move to route, trading, collect maintenance resources, maintenance, resupply, move to scrap, scrap.
+Each trader carries its own cash (`TraderStats.Budget`). If the planned purchase costs more than the budget, the trader asks its owner for the gap. If that's refused it asks for half, then for a quarter. A guild approves a request only if **account − emergency reserve > requested amount**; the cash then moves from the guild bank into the trader's budget. A city buyer sends the same requests, budget changes and cash returns to its home city instead. The city-side approval rule sits behind a virtual call that I did not resolve **[struct]**. The trader tick is a state machine over `ETraderTask`: move to route, trading, collect maintenance resources, maintenance, resupply, move to scrap, scrap.
 
-### 5.4 Guild life cycle: founding, branches, hiring, firing
+### 5.4 City buyers: how trade actually happens [code]
+
+Every city spawns its own traders when it is set up. The castle keep does the same with `InitialCityBuyers`. The target count is `NumCityBuyers` (**2**) plus any research or card bonuses. When the target changes, the city spawns or removes the difference. Each buyer is a normal `UTraderComponent` whose allegiance is the city, flagged as *city-owned*. It uses the same machinery as any trader (sections 5.1–5.3), with these differences:
+- **Routes:** a buyer serves every trade route that has its home port at one end. The list is rebuilt each time it re-plans.
+- **Direction:** each route is valued in both directions, but a buyer **never loads at its home port**. It only fetches goods from other ports and delivers them home.
+- **Value:** the same as for any trader. The greedy wagon fill gives the profit, minus (path length + extra) × transport cost.
+- **Money:** cash requests, budget changes and earnings go to the home city instead of a guild. The contract records `TraderOwner` = Target, meaning the trader belongs to the receiving port. The home city therefore pays the source city's sell price plus taxes, while the buy-minus-sell margin stays inside the city.
+- **Statistics:** utilization is averaged over `CityBuyerIntegrationTime` (60 s).
+
+So in the shipped game, imports are pulled by the buying city, which pays for its own hauling. Exports happen only because other cities' buyers come and collect them.
+
+### 5.5 Guild life cycle (present in code, dormant in the shipped game)
 
 **What native code does [code]:**
 - **Founding a guild.** The founding function refuses once `MaxSimultaneousFreeTradeGuilds` (5) guilds exist. The new guild's opening account is funded either by the port it starts in (from the port's cash) or from a caller-supplied amount, capped by what the payer holds. Starting a guild also restarts the association's founding cooldown (`GuildFoundingTimer += GuildFoundingTimeOut`). Character traits come from the guild's style, or are four independent uniform random numbers in [0, 1] when the style has none.
@@ -175,17 +186,18 @@ Each trader carries its own cash (`TraderStats.Budget`). If the planned purchase
 - **Opening a branch.** The port rejects the branch once it holds `MaxNumTradeGuildBranches` (6) branches. It then takes a market slot and settles the lease credit, either from its own funds or from the credit passed in. The branch registers with its guild, which **adds `FoundNewBranchTimeOut` (60 s) to the branch cooldown** and immediately **spawns one trader**. That trader is assigned to the guild route through this port with the highest *total gross profit*.
 - **Leases.** Every tick a branch owes the port lease x dt. It pays from its prepaid `BranchCredit` first, then from the guild account. When paid in full, the cost is booked against the branch's routes in equal shares, as negative transfers in route accounting.
 - **Firing traders.** Scrapping is triggered in only one way: the guild cannot pay a lease. The guild then walks its traders and pulls each one's whole cash budget back into the account until the shortfall is covered. **Every trader drained this way is scrapped.** One with a home branch drives there first (`MoveToScrap`), returns any cash, then is removed. Profit-based culling does not exist anywhere in native code.
-- **Bankruptcy.** If the lease still can't be paid after recalling trader cash, the guild dissolves. All traders are scrapped, all branches closed, and any remaining account goes to the **player's** budget. The guild is removed, and the founding cooldown resets to `GuildFoundingTimeOut`, or to 10% of it when no guild is left, so a replacement appears quickly.
+- **Bankruptcy.** If the lease still can't be paid after recalling trader cash, the guild dissolves. All traders are scrapped, all branches closed, and any remaining account goes to the **player's** budget. The guild is removed, and the founding cooldown resets to `GuildFoundingTimeOut`, or to 10% of it when no guild is left.
 - **Reassignment.** When routes change, a guild re-assigns traders to its highest-gross-profit route.
 - **Trader cash requests** (5.3): granted only if account - emergency reserve > amount.
 
-**What is decided in Blueprints [blueprint]:**
-- *When* to found a guild, *where* to open a branch, and *when* to spawn extra traders. `TryFoundTradeGuildInTargetPort`, `GuildCanAffordNewBranch` and `TrySpawnTraderForTradeGuildBranch` are Blueprint-callable, and no native code calls them.
-- The countdown of both cooldowns (`FoundNewBranchTimer`, `GuildFoundingTimer`). Native code only adds to them and checks them.
-- How the character traits and `FTradeGuildCharacterRelatedConstants` are applied. Native code sets the traits at founding, but no native float arithmetic reads them through the guild or applies those constants.
-- `EstimatedAdditionalProfitPerTraderPerSec` on routes is never written by native code.
+**Who triggers founding and expansion: nobody [code]:**
+- A guild object is created in exactly two places: when a save game is loaded, and inside `TryFoundTradeGuildInTargetPort`. A branch is created only on load and inside the port's `TryOpenTradeGuildBranch`.
+- These functions, `GuildCanAffordNewBranch` and `TrySpawnTraderForTradeGuildBranch` are reachable only through their reflection thunks. No native code calls them. No cooked asset references them: all 4,461 packages were unpacked and searched. Nothing calls them by name either: each name string is referenced only by the reflection tables, with no wide-string literal for a dynamic delegate.
+- The guild-spawning and branch-founding widgets (`USpawnTradeGuildMainWidget`, `UCardFoundNewTradeGuildBranchWidget`) exist as native classes, but no shipped Blueprint uses them. The shipped config sets `Feature_Cheats=False`.
+- The cooldowns never count down: native code only adds to `FoundNewBranchTimer` and `GuildFoundingTimer` and checks them. A guild that has opened one branch could therefore never pass the affordability check again.
+- Character traits are set at founding but never read by native arithmetic. `EstimatedAdditionalProfitPerTraderPerSec` on routes is never written.
 
-The UI hints that these decisions are partly the player's: there are cards to found branches and guilds, and a branch-purchase popup. Reading the actual rules needs the cooked Blueprints unpacked from the IoStore container (`.utoc`/`.ucas`, Oodle-compressed).
+Conclusion: the guild layer is complete but **dormant** in this build. Guilds appear only from save games, presumably older ones, since the config has `RepairOldSaveGames=True`, or through developer tools. City buyers (5.4) do the trading. `FCityConstants` still carries `CityTradeGuildStyle` and `SupplyCityTradeGuildTime` (10 s), which look like a bridge between the two designs. I found no native code reading them **[struct]**.
 
 Guild constants **[defaults]**:
 - New guild costs 500; a branch costs 200 (founding cost factor 2.0, gain bonus 10x, first founding 20x).
@@ -220,7 +232,7 @@ Housing tiles (`UResidentialTileComponent`) run these steps every economy tick, 
 - Quirk: both directions use **MaxMoveIn**. `MaxMoveOutProbabilityPerSec` is not read by this code.
 
 ### 6.3 Logistics [defaults]
-City transporters carry 5 units at speed 0.3, with load times of 0.5-3 s. Their queue priority weights wait time (1), city size (1) and storage fill (40). Construction materials get priority weight 0.8 and basic needs 0.4.
+Each city has 3 transporters (`NumCityTransporters`), each carrying up to 5 different goods and 5 units at speed 0.3, with load times of 0.5-3 s and up to 6 s idle. Their queue priority weights wait time (1), city size (1) and storage fill (40). Construction materials get priority weight 0.8 and basic needs 0.4.
 
 ## 7. Engine extras
 
@@ -235,19 +247,20 @@ City transporters carry 5 units at speed 0.3, with load times of 0.5-3 s. Their 
 5. **Cost-of-production anchor.** The theoretical price from the recipe graph keeps the global level tied to real production costs.
 6. **Liquidity feedback.** Broke ports stop bidding, so money and goods circulate instead of pooling.
 7. **Labour is the unit of value.** Residents create the coins, and the theoretical price of every good is a recipe-weighted amount of labour priced by one seed that tracks the coins in circulation. Inflation therefore follows population and happiness instead of being scripted.
-8. **Guilds die from cash flow, not from bad routes.** A guild only loses traders when it can't pay its branch leases. Unprofitable traders keep running until the money runs out, then get recalled one by one; if that isn't enough, the whole guild goes bankrupt.
+8. **Demand pulls the goods.** Trade is driven by the buyer: each city's own wagons go out to fetch what its port bids for and pay for the trip from city funds. There is no separate merchant class to keep solvent. Every city with demand and cash generates trade, and a broke city stops importing (takeaway 6).
+9. **(Dormant guilds) Cash flow, not bad routes, kills a guild.** In the guild layer, a guild only loses traders when it can't pay its branch leases. Unprofitable traders keep running until the money runs out, then get recalled one by one; if that isn't enough, the whole guild goes bankrupt.
 
 ---
 
 ### Simulation
-`ltt_sim.py` reimplements sections 2 (including the labour-seeded theoretical prices), 3, 4, 5.1-5.3, the native parts of 5.4, and 6.1-6.2 (production, consumption, happiness, income, migration). Simplifications and stand-ins:
+`ltt_sim.py` reimplements sections 2 (including the labour-seeded theoretical prices), 3, 4, 5.1–5.4 and 6.1–6.2 (production, consumption, happiness, income, migration). Each city starts with 2 city buyers, which import goods from the other cities to their home port. The dormant guild layer (5.5) is available with `--guilds`. In that mode, founding and branch decisions, which have no trigger in the shipped game, use simple stand-in rules: a guild opens a branch whenever it can afford one, and the richest port founds a new guild after the cooldown. Other simplifications:
 - Transport orders are built on the fly from port surpluses and shortfalls.
-- Blueprint-side decisions use simple rules. A guild opens a branch whenever it can afford one, in the city its best-earning route touches. The richest port founds a new guild after the founding cooldown.
-- The emergency reserve, the cash a trader keeps between trips, the critical happiness (0.5), the pay interval (10 s) and the happiness weights are sim choices. Resident pay is scaled down to the sim's price level.
+- The city's and guild's lending reserves, the cash a trader keeps between trips, the critical happiness (0.5), the pay interval (10 s) and the happiness weights are sim choices. Resident pay is scaled down to the sim's price level.
 - There is no player, so coins only enter through resident pay. Prices therefore inflate slowly through both money terms, as section 2 predicts.
 
 There are no bandits, knights, tiles, research or events. Run:
 
 ```
 python ltt_sim.py --seconds 7200 --csv run.csv
+python ltt_sim.py --seconds 7200 --guilds
 ```

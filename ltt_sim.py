@@ -7,9 +7,11 @@ Fixed set of cities. Each city has:
   - production buildings (recipes) staffed by residents; productivity = staffed share
   - housing with residents who consume goods, get happier or unhappier, pay coins,
     and move in or out by the game's occupancy-vs-happiness rule
-Guilds lease branches in ports and own traders that haul goods between ports.
+  - city buyers: wagons owned by the city that fetch goods from other ports and bring them home
+Optional (--guilds): the legacy guild layer, where guilds lease branches and own traders. The
+shipped game never founds guilds in a new game, so this is off by default.
 
-Run:  python ltt_sim.py [--seconds 3600] [--seed 1] [--csv out.csv]
+Run:  python ltt_sim.py [--seconds 3600] [--seed 1] [--csv out.csv] [--guilds]
 """
 import argparse
 import csv
@@ -55,6 +57,9 @@ GUILD_EMERGENCY_RESERVE = 100.0 # (simplification) guild never lends below this
 TRADER_BUDGET_KEEP = 150.0      # (simplification) cash a trader keeps after a trip
 TRADER_CAPACITY = 10
 TRADER_SPEED = 1.0              # distance units / second
+# city buyers
+NUM_CITY_BUYERS = 2             # CityConstants.NumCityBuyers
+CITY_BUYER_RESERVE = 100.0      # (simplification) a city never funds its buyers below this
 # guilds and branches
 BRANCH_COST = 200.0             # TradeGuild.SpawnGuildBranchDefaultCost (stand-in for the wagon price)
 BRANCH_LEASE = 0.1              # TradeGuild.DefaultBranchLease, coins per second paid to the port
@@ -175,8 +180,9 @@ class City:
 
 @dataclass
 class Trader:
-    guild: "Guild"
-    city: City
+    guild: "Guild"               # owning guild, or None for a city buyer
+    city: City                   # where the wagon currently is
+    home: City = None            # city buyer's home city (TraderAllegiance)
     task: str = "idle"           # idle | to_source | to_dest
     route: tuple = None          # (src, dst, [(good, qty), ...])
     route_value: float = 0.0     # profit/min of the route currently followed
@@ -199,7 +205,7 @@ class Guild:
 
 
 class Economy:
-    def __init__(self, seed=1):
+    def __init__(self, seed=1, guilds=False):
         self.rng = random.Random(seed)
         self.t = 0.0
         self.seed_value, self.seed_delta = 1.0, 0.1    # TheoreticalMarketSeedValue / its step
@@ -216,10 +222,13 @@ class Economy:
                 c.consume_acc[g] = 0.0
             c.satisfaction = {g: 1.0 for g in NEEDS}
             self.cities.append(c)
+        self.buyers = [Trader(None, c, home=c) for c in self.cities for _ in range(NUM_CITY_BUYERS)]
+        self.use_guilds = guilds
         self.guilds = []
         self.founding_timer = GUILD_FOUNDING_TIMEOUT
-        for gname, cname in START_GUILDS:
-            self.found_guild(gname, self.city(cname))
+        if guilds:
+            for gname, cname in START_GUILDS:
+                self.found_guild(gname, self.city(cname))
         self.log = []
 
     def city(self, name):
@@ -467,6 +476,9 @@ class Economy:
             for dst in self.cities:
                 if src is dst:
                     continue
+                # a city buyer serves routes touching its home and never loads there: it only imports
+                if tr.home is not None and (dst is not tr.home or src is tr.home):
+                    continue
                 load, profit, _ = self.fill_wagon(self.transport_orders(src, dst), TRADER_CAPACITY)
                 if profit < MIN_PROFIT:
                     continue
@@ -477,83 +489,86 @@ class Economy:
         return best
 
     def request_budget(self, tr, amount):
-        """Trader asks its guild for cash: full gap, then half, then a quarter."""
-        gd = tr.guild
+        """Trader asks its owner (guild, or home city for a buyer) for cash: full gap, then half,
+        then a quarter."""
+        owner = tr.guild or tr.home
+        reserve = GUILD_EMERGENCY_RESERVE if tr.guild else CITY_BUYER_RESERVE
         for part in (amount, amount * 0.5, amount * 0.25):
-            if part < gd.cash - GUILD_EMERGENCY_RESERVE:
-                gd.cash -= part
+            if part < owner.cash - reserve:
+                owner.cash -= part
                 tr.budget += part
                 return True
         return False
 
     def run_traders(self, dt):
-        for gd in self.guilds:
-            for tr in gd.traders:
-                if tr.task == "idle":
-                    tr.switch_timer -= dt
-                    if tr.switch_timer > 0:
+        for tr in self.buyers + [t for gd in self.guilds for t in gd.traders]:
+            gd = tr.guild
+            if tr.task == "idle":
+                tr.switch_timer -= dt
+                if tr.switch_timer > 0:
+                    continue
+                tr.switch_timer = ROUTE_SWITCH_TIMEOUT / 10
+                plan = self.plan_route(tr)
+                if plan is None and tr.route is None:
+                    continue
+                if plan is not None:
+                    tr.route, tr.route_value = plan[:3], plan[3]
+                tr.task, tr.eta = "to_source", tr.city.dist(tr.route[0]) / TRADER_SPEED + 2
+            elif tr.task == "to_source":
+                tr.eta -= dt
+                if tr.eta > 0:
+                    continue
+                src, dst, _ = tr.route
+                load, _, cost = self.fill_wagon(self.transport_orders(src, dst), TRADER_CAPACITY)
+                if cost > tr.budget:
+                    self.request_budget(tr, cost - tr.budget)
+                tr.city = src
+                for g, qty in load:
+                    st = src.storage[g]
+                    qty = min(qty, int(tr.budget / max(st.sell_price, 0.1)))
+                    if qty <= 0:
                         continue
-                    tr.switch_timer = ROUTE_SWITCH_TIMEOUT / 10
-                    plan = self.plan_route(tr)
-                    if plan is None and tr.route is None:
-                        continue
-                    if plan is not None:
-                        tr.route, tr.route_value = plan[:3], plan[3]
-                    tr.task, tr.eta = "to_source", tr.city.dist(tr.route[0]) / TRADER_SPEED + 2
-                elif tr.task == "to_source":
-                    tr.eta -= dt
-                    if tr.eta > 0:
-                        continue
-                    src, dst, _ = tr.route
-                    load, _, cost = self.fill_wagon(self.transport_orders(src, dst), TRADER_CAPACITY)
-                    if cost > tr.budget:
-                        self.request_budget(tr, cost - tr.budget)
-                    tr.city = src
-                    for g, qty in load:
-                        st = src.storage[g]
-                        qty = min(qty, int(tr.budget / max(st.sell_price, 0.1)))
-                        if qty <= 0:
-                            continue
-                        price = st.sell_price
-                        net_to_port = price / (1 + CITY_TAX)
-                        st.amount -= qty
-                        st.flow_acc -= qty
-                        tr.budget -= price * qty
-                        src.cash += net_to_port * qty
-                        src.tax_income += (price - net_to_port) * qty
-                        src.income_rate += net_to_port * qty
-                        tr.cargo.append((g, qty, price))
-                    if not tr.cargo:
-                        tr.task, tr.route, tr.route_value = "idle", None, 0.0
-                        continue
-                    tr.task, tr.eta = "to_dest", src.dist(dst) / TRADER_SPEED + 2
-                elif tr.task == "to_dest":
-                    tr.eta -= dt
-                    if tr.eta > 0:
-                        continue
-                    _, dst, _ = tr.route
-                    profit = 0.0
-                    for g, qty, paid in tr.cargo:
-                        st = dst.storage[g]
-                        price = st.buy_price
-                        gross = price * (1 + CITY_TAX)       # port pays price + tax
-                        qty = min(qty, st.max_amount - st.amount, int(dst.cash / gross))
-                        st.amount += qty
-                        st.flow_acc += qty
-                        dst.cash -= gross * qty
-                        dst.tax_income += (gross - price) * qty
-                        dst.spend_rate += gross * qty
-                        tr.budget += price * qty
-                        profit += (price - paid) * qty   # unsold units are written off
+                    price = st.sell_price
+                    net_to_port = price / (1 + CITY_TAX)
+                    st.amount -= qty
+                    st.flow_acc -= qty
+                    tr.budget -= price * qty
+                    src.cash += net_to_port * qty
+                    src.tax_income += (price - net_to_port) * qty
+                    src.income_rate += net_to_port * qty
+                    tr.cargo.append((g, qty, price))
+                if not tr.cargo:
+                    tr.task, tr.route, tr.route_value = "idle", None, 0.0
+                    continue
+                tr.task, tr.eta = "to_dest", src.dist(dst) / TRADER_SPEED + 2
+            elif tr.task == "to_dest":
+                tr.eta -= dt
+                if tr.eta > 0:
+                    continue
+                _, dst, _ = tr.route
+                profit = 0.0
+                for g, qty, paid in tr.cargo:
+                    st = dst.storage[g]
+                    price = st.buy_price
+                    gross = price * (1 + CITY_TAX)       # port pays price + tax
+                    qty = min(qty, st.max_amount - st.amount, int(dst.cash / gross))
+                    st.amount += qty
+                    st.flow_acc += qty
+                    dst.cash -= gross * qty
+                    dst.tax_income += (gross - price) * qty
+                    dst.spend_rate += gross * qty
+                    tr.budget += price * qty
+                    profit += (price - paid) * qty   # unsold units are written off
+                if gd:
                     gd.earned += profit
                     key = (tr.route[0].name, dst.name)
                     gd.route_profit[key] = gd.route_profit.get(key, 0.0) + profit
-                    tr.profit_avg += (profit - tr.profit_avg) * 0.2
-                    tr.cargo, tr.task, tr.city = [], "idle", dst
-                    # surplus trader cash flows back to the guild bank
-                    if tr.budget > TRADER_BUDGET_KEEP:
-                        gd.cash += tr.budget - TRADER_BUDGET_KEEP
-                        tr.budget = TRADER_BUDGET_KEEP
+                tr.profit_avg += (profit - tr.profit_avg) * 0.2
+                tr.cargo, tr.task, tr.city = [], "idle", dst
+                # surplus trader cash flows back to the owner (guild bank or home city)
+                if tr.budget > TRADER_BUDGET_KEEP:
+                    (gd or tr.home).cash += tr.budget - TRADER_BUDGET_KEEP
+                    tr.budget = TRADER_BUDGET_KEEP
 
     # ---------------------------------------------------------- guilds
     def found_guild(self, name, port):
@@ -653,7 +668,8 @@ class Economy:
         self.price_ports(dt)
         self.update_global_prices(dt)
         self.run_traders(dt)
-        self.run_guilds(dt)
+        if self.use_guilds:
+            self.run_guilds(dt)
         for c in self.cities:          # decay flow-rate accumulators (~60 s window)
             c.income_rate *= 1 - dt / 60
             c.spend_rate *= 1 - dt / 60
@@ -667,7 +683,8 @@ class Economy:
             row[f"{c.name}_pop"] = c.residents
             row[f"{c.name}_happy"] = round(c.happiness, 3)
         row["theo_seed"] = round(self.seed_value, 3)
-        for name in GUILD_NAMES:
+        row["buyers_profit_avg"] = round(sum(t.profit_avg for t in self.buyers) / max(len(self.buyers), 1), 2)
+        for name in GUILD_NAMES if self.use_guilds else []:
             gd = next((g for g in self.guilds if g.name == name), None)
             row[f"{name}_cash"] = round(gd.cash) if gd else ""
             row[f"{name}_traders"] = len(gd.traders) if gd else 0
@@ -688,6 +705,11 @@ class Economy:
             f"{c.name}: cash {c.cash:7.0f} tax {c.tax_income:6.0f} pop {c.residents:3d}/{c.capacity} "
             f"happy {c.happiness:.2f}" for c in self.cities))
         print(f"labour seed {self.seed_value:.3f}")
+        print("city buyers: " + "  ".join(
+            f"{c.name}: " + ",".join(f"{t.task}@{t.city.name[:3]}" for t in self.buyers if t.home is c)
+            for c in self.cities))
+        if not self.use_guilds:
+            return
         print("guilds: " + "  ".join(
             f"{g.name}: cash {g.cash:7.0f} traders {len(g.traders)} branches {len(g.branches)} "
             f"profit {g.earned:7.0f}" for g in self.guilds))
@@ -699,8 +721,9 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--report-every", type=int, default=600)
     ap.add_argument("--csv")
+    ap.add_argument("--guilds", action="store_true", help="enable the legacy guild layer")
     a = ap.parse_args()
-    eco = Economy(a.seed)
+    eco = Economy(a.seed, guilds=a.guilds)
     rows = []
     for s in range(a.seconds):
         eco.step()
