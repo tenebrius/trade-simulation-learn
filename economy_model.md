@@ -165,7 +165,7 @@ Ports don't talk to traders directly. Each port posts **market orders** (`FMarke
 - **Utilization** = loaded amount ÷ capacity, stored as `CurrentTraderUtilizationFraction` and fed into the guild's route statistics.
 
 ### 5.3 Trader cash [code]
-Each trader carries its own cash (`TraderStats.Budget`). If the planned purchase costs more than the budget, the trader asks its owner for the gap. If that's refused it asks for half, then for a quarter. A guild approves a request only if **account − emergency reserve > requested amount**; the cash then moves from the guild bank into the trader's budget. A city buyer sends the same requests, budget changes and cash returns to its home city instead. The city-side approval rule sits behind a virtual call that I did not resolve **[struct]**. The trader tick is a state machine over `ETraderTask`: move to route, trading, collect maintenance resources, maintenance, resupply, move to scrap, scrap.
+Each trader carries its own cash (`TraderStats.Budget`). If the planned purchase costs more than the budget, the trader asks its owner for the gap. If that's refused it asks for half, then for a quarter. A guild approves a request only if **account − emergency reserve > requested amount**; the cash then moves from the guild bank into the trader's budget. A city buyer sends the same requests to its home port instead, which grants one whenever **amount ≤ the port's `BankAmount`**. There is no reserve, so a city can lend its whole bank. The port also tracks the cash out with its wagons as `CashDistributedToTraders`. **After every delivery a trader hands all its cash back to its owner**, meaning its budget plus the proceeds, so no money stays with a wagon between trips. A city buyer flagged to return home first does so on arrival. The trader tick is a state machine over `ETraderTask`: move to route, trading, collect maintenance resources, maintenance, resupply, move to scrap, scrap.
 
 ### 5.4 City buyers: how trade actually happens [code]
 
@@ -173,7 +173,7 @@ Every city spawns its own traders when it is set up. The castle keep does the sa
 - **Routes:** a buyer serves every trade route that has its home port at one end. The list is rebuilt each time it re-plans.
 - **Direction:** each route is valued in both directions, but a buyer **never loads at its home port**. It only fetches goods from other ports and delivers them home.
 - **Value:** the same as for any trader. The greedy wagon fill gives the profit, minus (path length + extra) × transport cost.
-- **Money:** cash requests, budget changes and earnings go to the home city instead of a guild. The contract records `TraderOwner` = Target, meaning the trader belongs to the receiving port. The home city therefore pays the source city's sell price plus taxes, while the buy-minus-sell margin stays inside the city.
+- **Money:** the buyer borrows the purchase cost from its home port's bank (granted if the bank covers it) and returns everything after delivering. The contract records `TraderOwner` = Target, meaning the trader belongs to the receiving port. The home city therefore pays the source city's sell price plus taxes, while the buy-minus-sell margin stays inside the city.
 - **Statistics:** utilization is averaged over `CityBuyerIntegrationTime` (60 s).
 
 So in the shipped game, imports are pulled by the buying city, which pays for its own hauling. Exports happen only because other cities' buyers come and collect them.
@@ -255,7 +255,7 @@ Each city has 3 transporters (`NumCityTransporters`), each carrying up to 5 diff
 ### Simulation
 `ltt_sim.py` reimplements sections 2 (including the labour-seeded theoretical prices), 3, 4, 5.1–5.4 and 6.1–6.2 (production, consumption, happiness, income, migration). Each city starts with 2 city buyers, which import goods from the other cities to their home port. The dormant guild layer (5.5) is available with `--guilds`. In that mode, founding and branch decisions, which have no trigger in the shipped game, use simple stand-in rules: a guild opens a branch whenever it can afford one, and the richest port founds a new guild after the cooldown. Other simplifications:
 - Transport orders are built on the fly from port surpluses and shortfalls.
-- The city's and guild's lending reserves, the cash a trader keeps between trips, the critical happiness (0.5), the pay interval (10 s) and the happiness weights are sim choices. Resident pay is scaled down to the sim's price level.
+- The guild's emergency reserve, the critical happiness (0.5), the pay interval (10 s) and the happiness weights are sim choices. Resident pay is scaled down to the sim's price level.
 - There is no player, so coins only enter through resident pay. Prices therefore inflate slowly through both money terms, as section 2 predicts.
 
 There are no bandits, knights, tiles, research or events. Run:

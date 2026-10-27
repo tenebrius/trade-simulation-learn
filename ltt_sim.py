@@ -54,12 +54,10 @@ MONEY_RESERVE_TIME = 60.0       # TradeGuild.MoneyReserveTime
 ROUTE_SWITCH_TIMEOUT = 30.0     # TradeGuild.TraderRouteSwitchTimeOut
 MAX_PROFIT_DEV = 0.5            # TraderConstants.MaxProfitDeviationFraction
 GUILD_EMERGENCY_RESERVE = 100.0 # (simplification) guild never lends below this
-TRADER_BUDGET_KEEP = 150.0      # (simplification) cash a trader keeps after a trip
 TRADER_CAPACITY = 10
 TRADER_SPEED = 1.0              # distance units / second
 # city buyers
 NUM_CITY_BUYERS = 2             # CityConstants.NumCityBuyers
-CITY_BUYER_RESERVE = 100.0      # (simplification) a city never funds its buyers below this
 # guilds and branches
 BRANCH_COST = 200.0             # TradeGuild.SpawnGuildBranchDefaultCost (stand-in for the wagon price)
 BRANCH_LEASE = 0.1              # TradeGuild.DefaultBranchLease, coins per second paid to the port
@@ -489,12 +487,12 @@ class Economy:
         return best
 
     def request_budget(self, tr, amount):
-        """Trader asks its owner (guild, or home city for a buyer) for cash: full gap, then half,
-        then a quarter."""
+        """Trader asks its owner for cash: full gap, then half, then a quarter. A guild lends only
+        above its emergency reserve; a home port lends whenever its bank covers the amount."""
         owner = tr.guild or tr.home
-        reserve = GUILD_EMERGENCY_RESERVE if tr.guild else CITY_BUYER_RESERVE
         for part in (amount, amount * 0.5, amount * 0.25):
-            if part < owner.cash - reserve:
+            ok = part < owner.cash - GUILD_EMERGENCY_RESERVE if tr.guild else part <= owner.cash
+            if ok:
                 owner.cash -= part
                 tr.budget += part
                 return True
@@ -565,10 +563,9 @@ class Economy:
                     gd.route_profit[key] = gd.route_profit.get(key, 0.0) + profit
                 tr.profit_avg += (profit - tr.profit_avg) * 0.2
                 tr.cargo, tr.task, tr.city = [], "idle", dst
-                # surplus trader cash flows back to the owner (guild bank or home city)
-                if tr.budget > TRADER_BUDGET_KEEP:
-                    (gd or tr.home).cash += tr.budget - TRADER_BUDGET_KEEP
-                    tr.budget = TRADER_BUDGET_KEEP
+                # after delivering, the trader hands all its cash back to its owner
+                (gd or tr.home).cash += tr.budget
+                tr.budget = 0.0
 
     # ---------------------------------------------------------- guilds
     def found_guild(self, name, port):
