@@ -42,7 +42,7 @@ Port production, residents (consumption, happiness, migration, pay), local value
 | Quirk in ltt_sim.py | Fix (Realm) |
 |---|---|
 | income/spend "rates" are 60 s sums, so liquidity time is ~60× too short and rich ports act broke | per-second moving averages |
-| noisy switching can never accept a worse route; baseline is the stale value of the old route | model 5.2 rule: beat the best so far *and* noise × baseline, with the baseline re-evaluated now |
+| the switching baseline is the stale value the old route had when chosen | baseline re-valued now; a candidate must beat the best so far *and* noise × baseline (model 5.2), so a high draw makes a wagon stick to its route |
 | several wagons chase the same surplus (19% of trips find nothing to load) | wagons reserve what they plan to move (model 5.1) |
 | cash borrowed for an empty pickup stays in the wagon | returned to the home port |
 | delivery home is paid like a purchase from a stranger; goods that don't fit or can't be paid for vanish | a home delivery is an internal transfer (only tax is a real payment); overflow waits in the wagon, and loss is a loud, rare event |
@@ -123,7 +123,7 @@ Light and dark themes via CSS variables. Colour is never the only signal. Respec
 - Determinism (same seed → identical state).
 - The money ledger closes every tick (Realm and Reference).
 - Prices stay inside their bands; stock and cash never go negative.
-- Unit tests per fix; recipe solver; route choice can accept a worse route.
+- Unit tests per fix; recipe solver; a high noise draw makes a wagon stick to its route.
 - Playwright screenshots at 390×844 and 1280×800.
 
 ## Delivery

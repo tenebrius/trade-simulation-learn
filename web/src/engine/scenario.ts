@@ -17,6 +17,7 @@ export interface RecipeDef {
 }
 
 export interface NeedDef {
+  kind?: "food" | "luxury" | "construction";
   rate: number; //      units per resident per second
   supply: number; //    happiness bonus x satisfaction (luxuries)
   under: number; //     happiness penalty x shortfall (necessities)
@@ -28,16 +29,25 @@ export interface CityDef {
   residents: number;
   capacity: number;
   buildings: string[]; // output good of each building
+  blurb?: string;
+  cash?: number;
+  buyers?: number; //   city buyers (wagons); default NumCityBuyers = 2
+  stock?: Record<string, number>; // overrides the random start for these goods
 }
 
 export interface ScenarioOptions {
-  /** Route value subtracts path length x this (economy_model 5.4). 0 = the Python behaviour. */
+  /** true = reproduce ltt_sim.py exactly, quirks included (see docs/PLAN.md). false = fixed engine. */
+  quirks: boolean;
+  /** Route score subtracts path length x this (economy_model 5.4). */
   transportCost: number;
-  /** Fixes on top of ltt_sim.py; all off in the reference scenario so it matches Python exactly. */
-  reserveOrders: boolean; //   wagons reserve the surplus/shortfall they plan to move (5.1)
-  keepUnsold: boolean; //      unsold cargo is carried home instead of being thrown away
-  /** Starting stock is drawn uniformly from this range. */
+  /** Starting stock is drawn uniformly from this range unless a city sets its own. */
   startStock: [number, number];
+  /** Construction goods: their max buy price is multiplied by 10 (economy_model 3.2). */
+  construction: string[];
+  tax: number;
+  /** Wagon speed (map units per second) and capacity. Python: 1 and 10. */
+  wagonSpeed: number;
+  wagonCapacity: number;
 }
 
 export interface Scenario {

@@ -23,9 +23,9 @@ export const reference: Scenario = {
     tools: { inputs: { wood: 3 }, out: 1, seconds: 15, labour: 2, name: "Toolmaker" },
   },
   needs: {
-    bread: { rate: 0.0025, supply: 0.0, under: -0.35 },
-    fish: { rate: 0.0015, supply: 0.0, under: -0.2 },
-    tools: { rate: 0.0004, supply: 0.15, under: 0.0 },
+    bread: { kind: "food", rate: 0.0025, supply: 0.0, under: -0.35 },
+    fish: { kind: "food", rate: 0.0015, supply: 0.0, under: -0.2 },
+    tools: { kind: "luxury", rate: 0.0004, supply: 0.15, under: 0.0 },
   },
   cities: [
     { name: "Ashford", pos: [0, 0], residents: 30, capacity: 60, buildings: ["grain", "grain", "flour", "bread"] },
@@ -34,5 +34,5 @@ export const reference: Scenario = {
     { name: "Dunmere", pos: [55, 50], residents: 25, capacity: 55, buildings: ["wood", "bread", "tools"] },
   ],
   roads: [],
-  options: { transportCost: 0, reserveOrders: false, keepUnsold: false, startStock: [10, 40] },
+  options: { quirks: true, transportCost: 0, startStock: [10, 40], construction: [], tax: 0.1, wagonSpeed: 1, wagonCapacity: 10 },
 };
