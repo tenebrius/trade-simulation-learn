@@ -98,7 +98,7 @@ Each tick the port computes a set of additive parts (`FTradePortPidParts`). On t
 |---|---|---|
 | Proportional | `P · OpenBuyVolume / DesiredAmount` (missing fraction) | P = 0.2 |
 | Integral | `I · ∫ missing-fraction history` | I = 0.005 |
-| Expected trend (D1) | `−D1 · ExpectedTrend`: stock already rising, so ease off | D1 = 0.4 |
+| Expected trend (D1) | `−D1 · ExpectedTrend`: the city already makes more than it uses, so ease off (ExpectedTrend is defined in 3.3.1) | D1 = 0.4 |
 | Market value change (D2) | `−D2 · mean relative price-delta trend of the good` | D2 = 0 |
 | Local to global | `−1.8 · (price − global) / global` | 1.8 |
 | Remaining liquidity | `−0.8 · ExpectedRemainingLiquidityFactor` | 0.8 |
@@ -106,8 +106,8 @@ Each tick the port computes a set of additive parts (`FTradePortPidParts`). On t
 | Cheaper to buy than produce | `0.2 · max(0, (localValue − price)/localValue) · (1 − liquidity)` | 0.2 |
 | Overpriced buy | `−0.4 · max(0, price − lowerCritical) …` scaled by the fill target | −0.4 |
 | High priority | flat weight if fill is below the player's high-priority threshold | per good |
-| Market share | `(−P −I −D) parts · 0.85 · (1 − competitor coverage) · turnover factor` | 0.85 |
-| Generosity | rich cities (wealth share > onset 1.0) bias toward paying more | 1.2, money-saver factor 0.7 |
+| Market share | `−(P + I + D1 parts) · 0.85 · (1 − competitor coverage) · achieved turnover` (3.3.1) | 0.85 |
+| Generosity | `(1.2 − market share part − 0.7 · money-saving parts) · wealth · (1 − liquidity factor)` (3.3.1) | 1.2, money-saver factor 0.7 |
 | New port bonus | `0.8 × remaining fraction of a 400 s window` | 0.8 |
 | Uneven stock distribution | `−1.0 · (unevenness value)` | 1.0 |
 | Subsidy | `+0.6` if the good is subsidised (and a looser rate cap of 4%/s) | 0.6 |
@@ -120,6 +120,43 @@ The **sell side** mirrors this. The signs flip where it makes sense (a rising st
 - *Unused sell priority*: −0.1 when nothing is flowing.
 
 The sell priority is clamped to [0, 1].
+
+#### 3.3.1 Market share and generosity [code]
+
+Both parts are computed in the port's per-good tick, after the PID parts.
+
+**Expected trend.** Each city keeps three rates per good: production, industry consumption and resident consumption. Producers and consumers register their current per-second rates there. Whenever one changes, the city sets its port's `ExpectedTrend` = production − industry use − resident use. The economy keeps two totals per good, updated with the change in each port's trend:
+- `TotalTradableProductionSurplus` = sum of the positive trends.
+- `TotalTradableProductionDeficiency` = sum of |negative trends|.
+
+So these are rates of local production and use. Trade and stock levels do not enter them.
+
+**Competitor coverage** (`CompetitorMarketCoverage`) is the share of the other side of the market that rival ports would take up. Let *own* = |ExpectedTrend| of this port.
+- Buying: coverage = clamp((deficiency − own) / surplus, 0, 1). The other buyers' demand is compared with the total supply.
+- Selling: coverage = clamp((surplus − own) / deficiency, 0, 1). The other sellers' supply is compared with the total demand.
+- If the denominator is 0, coverage stays 0 and the market share part is 0.
+
+**Achieved turnover** (`AchievedDesiredMarketShareTurnoverFraction`):
+- Optimum = min(supply, own) when buying, or min(demand, own) when selling. This is `OptimumResourceTurnover`.
+- Desired = optimum × `DesiredTurnoverFractionToAchieve` (1.2).
+- Achieved = min(1, |traded amount per second| / desired), where the traded amount comes from the storage's `CachedTradedAmounts` history. It is 0 when the optimum is 0.
+
+**Market share part.** It applies only while coverage < 1. On the buy side it is also skipped when an unnamed flag at storage +0x50 is set.
+
+  `MarketSharePart = −(I part + P part + D1 part) × 0.85 × (1 − coverage) × achieved`
+
+When few rivals compete for the same goods and the port already gets its desired share of the flow, up to 85% of the PID urgency is cancelled. Uncontested ports stop overbidding (buying) or undercutting (selling). With many rivals (coverage → 1), the part fades to 0.
+
+**Wealth share** (`CityRelativeWealthShare`) is the city's bank balance divided by the average balance over all cities. Each city registers its port's `BankAmount` in the economy's budget tree, and the share is (number of cities × this city's entry) / total of the entries.
+
+**Generosity part.** It applies when `PortGenerositySetting` (default 1.0) > 0:
+
+  `GenerosityPart = (1.2 − MarketSharePart − 0.7 × money-saving parts) × clamp(wealth share − 1.0, 0, 1) × (1 − ExpectedRemainingLiquidityFactor) × PortGenerositySetting`
+
+- Money-saving parts on the buy side: income-to-spending disparity + overpriced buy.
+- Money-saving parts on the sell side: unused sell priority + income-to-spending disparity + selling under production cost.
+
+A city at or below average wealth is never generous. Above average, it adds up to +1.2 priority, gives back the market share discount, and gives back 70% of its money-saving penalties. Its port bids higher and sells cheaper, which pushes its cash out to poorer cities. The term shrinks as the city's cash reserve runs low.
 
 ### 3.4 From priority to price
 
@@ -248,13 +285,15 @@ Each city has 3 transporters (`NumCityTransporters`), each carrying up to 5 diff
 6. **Liquidity feedback.** Broke ports stop bidding, so money and goods circulate instead of pooling.
 7. **Labour is the unit of value.** Residents create the coins, and the theoretical price of every good is a recipe-weighted amount of labour priced by one seed that tracks the coins in circulation. Inflation therefore follows population and happiness instead of being scripted.
 8. **Demand pulls the goods.** Trade is driven by the buyer: each city's own wagons go out to fetch what its port bids for and pay for the trip from city funds. There is no separate merchant class to keep solvent. Every city with demand and cash generates trade, and a broke city stops importing (takeaway 6).
-9. **(Dormant guilds) Cash flow, not bad routes, kills a guild.** In the guild layer, a guild only loses traders when it can't pay its branch leases. Unprofitable traders keep running until the money runs out, then get recalled one by one; if that isn't enough, the whole guild goes bankrupt.
+9. **Uncontested ports relax, rich ports give.** A port that already gets its share of an uncontested market drops most of its PID urgency instead of overbidding. A city richer than average turns generous: it bids higher and sells cheaper, so its surplus cash flows out to poorer cities (3.3.1).
+10. **(Dormant guilds) Cash flow, not bad routes, kills a guild.** In the guild layer, a guild only loses traders when it can't pay its branch leases. Unprofitable traders keep running until the money runs out, then get recalled one by one; if that isn't enough, the whole guild goes bankrupt.
 
 ---
 
 ### Simulation
 `ltt_sim.py` reimplements sections 2 (including the labour-seeded theoretical prices), 3, 4, 5.1–5.4 and 6.1–6.2 (production, consumption, happiness, income, migration). Each city starts with 2 city buyers, which import goods from the other cities to their home port. The dormant guild layer (5.5) is available with `--guilds`. In that mode, founding and branch decisions, which have no trigger in the shipped game, use simple stand-in rules: a guild opens a branch whenever it can afford one, and the richest port founds a new guild after the cooldown. Other simplifications:
 - Transport orders are built on the fly from port surpluses and shortfalls.
+- Market share and generosity (3.3.1) follow the decompiled formulas. Expected trends come from staffed building rates and resident needs. The traded amount per second is a 30 s moving average (the window of the game's traded-amount history was not recovered), and the sell side has no unused-sell or income-disparity parts.
 - The guild's emergency reserve, the critical happiness (0.5), the pay interval (10 s) and the happiness weights are sim choices. Resident pay is scaled down to the sim's price level.
 - There is no player, so coins only enter through resident pay. Prices therefore inflate slowly through both money terms, as section 2 predicts.
 

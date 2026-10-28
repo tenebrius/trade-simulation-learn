@@ -40,6 +40,12 @@ MAX_URGENCY = 0.5               # MaxUrgencyPriceChangeBonus
 SMOOTH_TIME = 6.0               # DeltaPriceSmoothTime
 NEW_PORT_BONUS_T, NEW_PORT_BONUS_W = 400.0, 0.8
 MIN_PRICE = 0.1
+MAX_MARKET_SHARE = 0.85         # MaxMarketShareFactor
+DESIRED_TURNOVER = 1.2          # DesiredTurnoverFractionToAchieve
+GENEROSITY_W = 1.2              # GenerosityBaseWeight
+MONEY_SAVER = 0.7               # GenerosityMoneySaverOverwriteFactor
+WEALTH_ONSET = 1.0              # RelativeWealthGenerosityOnset
+PORT_GENEROSITY = 1.0           # UTradePort.PortGenerositySetting
 STOCK_INTEGRATION = 300.0       # StockDataIntegrationTime
 MEAN_TO_GLOBAL_W = 0.01         # EconomyConstants.MeanToGlobalPriceWeightPerSec
 THEO_TO_GLOBAL_W = 0.002        # EconomyConstants.TheoreticalToGlobalPriceWeightPerSec
@@ -132,11 +138,12 @@ class Storage:
     desired_fill: float = DESIRED_FILL
     buy_price: float = -1.0
     sell_price: float = -1.0
-    trend: float = 0.0            # measured net inflow per sec (smoothed)
+    expected: float = 0.0         # ExpectedTrend: local production - consumption per sec
+    traded: float = 0.0           # units traded through the port per sec (smoothed)
+    traded_acc: float = 0.0       # units traded this tick
     integral: float = 0.0         # integrated relative discrepancy
     price_delta_smooth: float = 0.0
     priority: float = 0.0
-    flow_acc: float = 0.0         # net units moved this tick
     local_value: float = 0.0      # what local producers would pay / it costs to make here
 
     @property
@@ -249,13 +256,11 @@ class Economy:
                     if all(c.storage[i].amount >= q for i, q in inputs.items()):
                         for i, q in inputs.items():
                             c.storage[i].amount -= q
-                            c.storage[i].flow_acc -= q
                         b.running, b.progress = True, 0.0
                 if b.running and b.progress < 1.0:
                     b.progress += dt / secs * (b.workers / WORKERS_PER_BUILDING)
                 if b.running and b.progress >= 1.0 and st_out.amount + out_qty <= st_out.max_amount:
                     st_out.amount += out_qty          # blocked while the output storage is full
-                    st_out.flow_acc += out_qty
                     b.running = False
 
     # ---------------------------------------------------------- residents
@@ -268,7 +273,6 @@ class Economy:
                 if n:
                     take = min(n, c.storage[g].amount)
                     c.storage[g].amount -= take
-                    c.storage[g].flow_acc -= take
                     c.consume_acc[g] -= n
                     c.satisfaction[g] = take / n
             # target happiness: base + per need (satisfaction x supply bonus, or
@@ -335,7 +339,53 @@ class Economy:
                 st.local_value = max(MIN_PRICE, v)
 
     # ---------------------------------------------------------- pricing
+    def expected_trends(self):
+        """ExpectedTrend per port and good: the city's own production rate minus its industry and
+        resident consumption rates. Positive trends add up to the global tradable surplus,
+        negative ones to the global deficiency."""
+        self.surplus = {g: 0.0 for g in GOODS}
+        self.deficiency = {g: 0.0 for g in GOODS}
+        for c in self.cities:
+            rate = {g: 0.0 for g in GOODS}
+            for b in c.buildings:
+                inputs, out_qty, secs, _ = RECIPES[b.output]
+                staffed = b.workers / WORKERS_PER_BUILDING
+                rate[b.output] += out_qty / secs * staffed
+                for i, q in inputs.items():
+                    rate[i] -= q / secs * staffed
+            for g, (need, _, _) in NEEDS.items():
+                rate[g] -= need * c.residents
+            for g, r in rate.items():
+                c.storage[g].expected = r
+                if r > 0:
+                    self.surplus[g] += r
+                else:
+                    self.deficiency[g] -= r
+
+    def market_share(self, st, g, buying):
+        """MaxMarketShareFactor x (1 - competitor coverage) x achieved turnover fraction.
+        Coverage: what the other ports' demand (buying) or supply (selling) would absorb of the
+        opposite side of the market. Turnover: traded rate against 1.2 x the rate this port could get."""
+        have, other = (self.surplus[g], self.deficiency[g]) if buying else (self.deficiency[g], self.surplus[g])
+        if have <= 0:
+            return 0.0
+        own = abs(st.expected)
+        coverage = min(1.0, max(0.0, other - own) / have)
+        optimum = min(have, own)
+        if optimum <= 0:
+            return 0.0
+        achieved = min(1.0, abs(st.traded) / (optimum * DESIRED_TURNOVER))
+        return MAX_MARKET_SHARE * (1 - coverage) * achieved
+
+    def generosity(self, c, liq_factor, market_share_part, money_saving_parts):
+        """Cities richer than average undo the market share discount and most money-saving terms."""
+        wealth = max(0.0, min(1.0, c.cash / self.mean_cash - WEALTH_ONSET)) if self.mean_cash > 0 else 0.0
+        return ((GENEROSITY_W - market_share_part - MONEY_SAVER * money_saving_parts)
+                * wealth * (1 - liq_factor) * PORT_GENEROSITY)
+
     def price_ports(self, dt):
+        self.expected_trends()
+        self.mean_cash = sum(c.cash for c in self.cities) / len(self.cities)   # CityRelativeWealthShare base
         for c in self.cities:
             if c.new_port_timer > 0:
                 c.new_port_timer -= dt
@@ -345,8 +395,8 @@ class Economy:
             disparity = (c.spend_rate - c.income_rate) / max(c.spend_rate + c.income_rate, 1e-3)
             for g, st in c.storage.items():
                 k = dt / STOCK_INTEGRATION
-                st.trend += (st.flow_acc / dt - st.trend) * min(1.0, k * 10)
-                st.flow_acc = 0
+                st.traded += (st.traded_acc / dt - st.traded) * min(1.0, k * 10)
+                st.traded_acc = 0
                 mean, glob = self.mean[g], self.glob[g]
                 # price bands around the global mean
                 buy_lo, buy_hi = (1 - MAX_DEV + BUY_SELL_SHIFT) * mean, max(
@@ -360,16 +410,22 @@ class Economy:
                     rel = missing / max(st.desired, 1)
                     # windowed sum of the discrepancy over the last ~STOCK_INTEGRATION seconds
                     st.integral = st.integral * (1 - dt / STOCK_INTEGRATION) + rel * dt
+                    pid = (P_W * rel                                 # proportional
+                           - D1_W * st.expected                      # stock already rising -> relax
+                           + I_W * st.integral)                      # accumulated shortage
+                    inc_part = -INC_SPEND_W * max(0.0, disparity)    # spending > income
+                    over_part = OVERPRICED_BUY_F * max(0.0, st.buy_price - st.local_value) / max(mean, 1e-3)
+                    share_part = -pid * self.market_share(st, g, buying=True)   # few rival buyers -> relax
                     terms = [
-                        P_W * rel,                                   # proportional
-                        -D1_W * st.trend,                            # stock already rising -> relax
-                        I_W * st.integral,                           # accumulated shortage
+                        pid,
                         -L2G_W * (st.buy_price - glob) / glob,       # pull to global price
                         -REM_LIQ_W * liq_factor,                     # running out of cash
-                        -INC_SPEND_W * max(0.0, disparity),          # spending > income
+                        inc_part,
                         CHEAPER_BUY_W * max(0.0, (st.local_value - st.buy_price) / st.local_value)
                         * (1 - liq_factor),
-                        OVERPRICED_BUY_F * max(0.0, st.buy_price - st.local_value) / max(mean, 1e-3),
+                        over_part,
+                        share_part,
+                        self.generosity(c, liq_factor, share_part, inc_part + over_part),
                         new_bonus,
                     ]
                     prio = max(1e-4, min(1.0, sum(terms)))
@@ -380,12 +436,16 @@ class Economy:
                     surplus = -missing
                     rel = surplus / max(st.max_amount - st.desired, 1)
                     st.integral = st.integral * (1 - dt / STOCK_INTEGRATION)
+                    pid = P_W * rel + D1_W * st.expected             # stock still rising -> sell harder
+                    under_part = SELL_UNDER_W * max(0.0, st.local_value - st.sell_price) / max(st.sell_price, 0.1)
+                    share_part = -pid * self.market_share(st, g, buying=False)  # few rival sellers -> relax
                     terms = [
-                        P_W * rel,
-                        D1_W * st.trend,                             # stock still rising -> sell harder
+                        pid,
                         L2G_W * (st.sell_price - glob) / glob,       # above global -> cut price
                         -REM_LIQ_W * liq_factor * -1,                # need cash -> sell harder
-                        SELL_UNDER_W * max(0.0, st.local_value - st.sell_price) / max(st.sell_price, 0.1),
+                        under_part,
+                        share_part,
+                        self.generosity(c, liq_factor, share_part, under_part),
                         new_bonus,
                     ]
                     prio = max(0.0, min(1.0, sum(terms)))
@@ -529,7 +589,7 @@ class Economy:
                     price = st.sell_price
                     net_to_port = price / (1 + CITY_TAX)
                     st.amount -= qty
-                    st.flow_acc -= qty
+                    st.traded_acc += qty
                     tr.budget -= price * qty
                     src.cash += net_to_port * qty
                     src.tax_income += (price - net_to_port) * qty
@@ -551,7 +611,7 @@ class Economy:
                     gross = price * (1 + CITY_TAX)       # port pays price + tax
                     qty = min(qty, st.max_amount - st.amount, int(dst.cash / gross))
                     st.amount += qty
-                    st.flow_acc += qty
+                    st.traded_acc += qty
                     dst.cash -= gross * qty
                     dst.tax_income += (gross - price) * qty
                     dst.spend_rate += gross * qty
