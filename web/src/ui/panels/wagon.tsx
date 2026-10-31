@@ -3,6 +3,7 @@ import type { TripReceipt } from "../../engine/types";
 import { DepthOnly, Eq, Link, Section } from "../bits";
 import { coins, num } from "../format";
 import { useStore } from "../store";
+import { Term } from "../term";
 
 export function WagonInspect({ id }: { id: number }) {
   const s = useStore();
@@ -39,11 +40,14 @@ export function WagonInspect({ id }: { id: number }) {
       {p && (
         <Section title={`How it chose (at ${Math.round(p.t)} s)`}>
           <p class="small">
-            For each port it could fetch from, the wagon fills its {e.sc.options.wagonCapacity} slots greedily with the goods that earn most (amount × margin),
-            {e.quirks ? "" : ` subtracts haulage (${e.sc.options.transportCost} c per unit of road)`} and divides by the trip time to get a score per minute.
+            For each port it could fetch from, the wagon fills its {e.sc.options.wagonCapacity} slots greedily with the goods that earn most (amount × <Term id="margin">margin</Term>),
+            {e.quirks ? "" : <>
+              {" "}
+              subtracts <Term id="haulage">haulage</Term> ({e.sc.options.transportCost} c per unit of road)
+            </>} and divides by the trip time to get a <Term id="route-score">route score</Term> per minute.
           </p>
           <p class="small">
-            Then it draws a random number r = {num(p.r)}. A new route must beat {num(p.noise)} × the current route's score ({num(p.baseline)}).{" "}
+            Then it draws a <Term id="noise">random bar</Term>: r = {num(p.r)}. A new route must beat {num(p.noise)} × the current route's score ({num(p.baseline)}).{" "}
             {p.noise > 1.05
               ? "This draw made it stubborn: it needs a clearly better route to switch."
               : p.noise < 0.95

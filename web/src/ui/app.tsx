@@ -8,7 +8,9 @@ import { Learn } from "./panels/learn";
 import { Market } from "./panels/market";
 import { PriceInspect } from "./panels/price";
 import { WagonInspect } from "./panels/wagon";
+import { LESSONS, lessonNumber } from "./learn/curriculum";
 import { type Depth, type SheetSize, type Tab, store, useStore } from "./store";
+import { TermSheet } from "./term";
 
 const TABS: [Tab, string, string][] = [
   ["feed", "Feed", "≡"],
@@ -145,6 +147,11 @@ export function App() {
           ))}
         </nav>
         <div class="sheet-body" ref={bodyRef}>
+          {s.tab !== "learn" && (s.lesson || s.learnChapter !== null) && (
+            <button type="button" class="lesson-banner" onClick={() => s.set("tab", "learn")}>
+              ← Back to {s.lesson ? `lesson ${lessonNumber(s.lesson.id)}: ${LESSONS.find((l) => l.id === s.lesson!.id)?.title ?? ""}` : "the experiment"}
+            </button>
+          )}
           {s.tab === "feed" && <Feed />}
           {s.tab === "market" && <Market />}
           {s.tab === "inspect" && <Inspect />}
@@ -152,6 +159,7 @@ export function App() {
           {s.tab === "learn" && <Learn />}
         </div>
       </aside>
+      <TermSheet />
     </div>
   );
 }

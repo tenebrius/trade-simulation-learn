@@ -1,13 +1,14 @@
-import { useState } from "preact/hooks";
 import { SidePill, StockBar } from "../bits";
 import { Spark } from "../chart";
 import { coins, num, signed } from "../format";
 import { useStore } from "../store";
+import { Term } from "../term";
 
 export function Market() {
   const s = useStore();
   const e = s.engine;
-  const [g, setG] = useState(e.needGoods[0] ?? 0);
+  const g = s.marketGood ?? e.needGoods[0] ?? 0;
+  const setG = (i: number) => s.set("marketGood", i);
   const good = e.goods[Math.min(g, e.goods.length - 1)];
   const gi = e.goods.indexOf(good);
   const div = s.real ? e.s.seedValue : 1;
@@ -25,19 +26,27 @@ export function Market() {
       </div>
       <div class="kv-row">
         <div class="kv">
-          <span class="k">Realm-wide</span>
+          <span class="k">
+            <Term id="realm-price">Realm-wide</Term>
+          </span>
           <span class="v num">{coins(e.s.glob[gi] / div)}</span>
         </div>
         <div class="kv">
-          <span class="k">Cost to make</span>
+          <span class="k">
+            <Term id="cost-to-make">Cost to make</Term>
+          </span>
           <span class="v num">{coins(e.s.theo[gi] / div)}</span>
         </div>
         <div class="kv">
-          <span class="k">In stock</span>
+          <span class="k">
+            <Term id="stock">In stock</Term>
+          </span>
           <span class="v num">{e.s.global?.volume[gi] ?? 0}</span>
         </div>
         <div class="kv">
-          <span class="k">Wanted</span>
+          <span class="k">
+            <Term id="shortage">Wanted</Term>
+          </span>
           <span class="v num">{e.s.global?.orders[gi].volume ?? 0}</span>
         </div>
       </div>
@@ -50,7 +59,7 @@ export function Market() {
       <div class="btn-row">
         <label class="toggle inline">
           <input id="real-prices" type="checkbox" checked={s.real} onChange={() => s.set("real", !s.real)} />
-          Real prices (÷ labour seed)
+          <Term id="real-prices">Real prices</Term> (÷ <Term id="labour-seed">labour seed</Term>)
         </label>
         <button type="button" class="btn tiny ghost" onClick={() => s.pin()}>
           {pinned ? "Re-pin now" : "Pin “before”"}

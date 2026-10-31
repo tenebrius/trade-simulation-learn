@@ -60,6 +60,14 @@ export class Store {
   pinned: Pinned | null = null;
   onboarded = load<boolean>("onboarded", false);
   learnChapter: number | null = null;
+  /** the course: the open lesson and card, and finished lessons (kept between visits) */
+  lesson: { id: string; card: number } | null = load("lesson", null);
+  done: string[] = load<string[]>("done", []);
+  learnView: "home" | "glossary" = "home";
+  /** the glossary entry shown in the definition sheet */
+  termOpen: string | null = null;
+  /** the good shown in the Market tab (null = the first need) */
+  marketGood: number | null = null;
   /** sub-tick progress 0..1, for smooth wagon motion */
   frac = 0;
   version = 0;
@@ -104,6 +112,24 @@ export class Store {
     this[key] = value;
     if (key === "depth") save("depth", value);
     if (key === "onboarded") save("onboarded", value);
+    this.emit();
+  }
+
+  openTerm(id: string | null) {
+    this.termOpen = id;
+    this.emit();
+  }
+
+  openLesson(id: string | null, card = 0) {
+    this.lesson = id ? { id, card } : null;
+    this.learnChapter = null;
+    save("lesson", this.lesson);
+    this.emit();
+  }
+
+  finishLesson(id: string) {
+    if (!this.done.includes(id)) this.done = [...this.done, id];
+    save("done", this.done);
     this.emit();
   }
 

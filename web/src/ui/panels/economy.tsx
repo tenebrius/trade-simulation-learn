@@ -3,6 +3,7 @@ import { DepthOnly, Eq, Section } from "../bits";
 import { Chart } from "../chart";
 import { coins, num, pct } from "../format";
 import { SCENARIOS, store, useStore } from "../store";
+import { Term } from "../term";
 
 export function Economy() {
   const s = useStore();
@@ -21,7 +22,9 @@ export function Economy() {
             <span class="num">{coins(l.start)}</span>
           </div>
           <div>
-            <span class="k">+ paid by residents</span>
+            <span class="k">
+              + <Term id="pay">paid by residents</Term>
+            </span>
             <span class="num pos">{coins(l.minted)}</span>
           </div>
           {l.gifts > 0 && (
@@ -31,7 +34,9 @@ export function Economy() {
             </div>
           )}
           <div>
-            <span class="k">− taxes to the crown</span>
+            <span class="k">
+              − <Term id="tax">taxes</Term> to the <Term id="crown">crown</Term>
+            </span>
             <span class="num neg">{coins(l.taxed)}</span>
           </div>
           <div class="total">
@@ -54,7 +59,7 @@ export function Economy() {
         />
       </Section>
 
-      <Section title="Money vs goods: the inflation term">
+      <Section title="Money vs goods: the money supply term">
         {g && (
           <>
             <div class="meter" role="img" aria-label={`Cities hold ${coins(g.cash)} coins; the target is ${coins(target)}`}>
@@ -90,7 +95,7 @@ export function Economy() {
         {g && (
           <>
             <p class="small">
-              Every good's cost to make is a recipe of labour, priced at one number, the labour seed: now <b class="num">{num(e.s.seedValue, 3)}</b>. The seed steers
+              Every good's <Term id="cost-to-make">cost to make</Term> is a recipe of labour, priced at one number, the <Term id="labour-seed">labour seed</Term>: now <b class="num">{num(e.s.seedValue, 3)}</b>. The seed steers
               itself so that cash ≈ 2 × the cost-value of the stock. Cash is {g.seedErr > 0 ? "above" : "below"} that, so the step was multiplied by{" "}
               <b class="num">{g.seedFactor === 1 ? "1" : g.seedFactor > 0 ? "1.1 (keep going)" : "−0.9 (turn around)"}</b>.
             </p>

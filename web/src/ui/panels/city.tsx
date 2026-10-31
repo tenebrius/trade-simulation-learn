@@ -3,6 +3,7 @@ import { DepthOnly, Eq, Link, Section, SidePill, StockBar } from "../bits";
 import { Chart } from "../chart";
 import { coins, num, pct, signed } from "../format";
 import { useStore } from "../store";
+import { Term } from "../term";
 
 const STATE_TEXT = {
   running: "working",
@@ -38,13 +39,17 @@ export function CityInspect({ city: ci }: { city: number }) {
       {def.blurb && <p class="why">{def.blurb}</p>}
       <div class="kv-row">
         <div class="kv">
-          <span class="k">People</span>
+          <span class="k">
+            <Term id="resident">People</Term>
+          </span>
           <span class="v num">
             {c.residents}/{c.capacity}
           </span>
         </div>
         <div class="kv">
-          <span class="k">Happiness</span>
+          <span class="k">
+            <Term id="happiness">Happiness</Term>
+          </span>
           <span class="v num">{num(c.happiness)}</span>
         </div>
         <div class="kv">
@@ -52,7 +57,9 @@ export function CityInspect({ city: ci }: { city: number }) {
           <span class="v num gold">{coins(c.cash)}</span>
         </div>
         <div class="kv">
-          <span class="k">Tax</span>
+          <span class="k">
+            <Term id="tax">Tax</Term>
+          </span>
           <span class="v num">{pct(c.tax)}</span>
         </div>
       </div>

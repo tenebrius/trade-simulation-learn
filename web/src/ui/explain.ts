@@ -68,8 +68,8 @@ export function priceWhy(e: Engine, ci: number, g: number): string {
 export function bandSentence(t: PriceTrace): string {
   const [lo, hi] = t.side === "buy" ? t.buyBand : t.sellBand;
   return t.side === "buy"
-    ? `Priority ${num(t.priority)} puts the target at ${pct(t.priority)} of the way from ${coins(lo)} to ${coins(hi)}: ${coins(t.target)}.`
-    : `Priority ${num(t.priority)} puts the target at ${pct(t.priority)} of the way down from ${coins(hi)} to ${coins(lo)}: ${coins(t.target)}.`;
+    ? `Eagerness ${num(t.priority)} puts the target at ${pct(t.priority)} of the way from ${coins(lo)} to ${coins(hi)}: ${coins(t.target)}.`
+    : `Eagerness ${num(t.priority)} puts the target at ${pct(t.priority)} of the way down from ${coins(hi)} to ${coins(lo)}: ${coins(t.target)}.`;
 }
 
 export interface ChainStep {
@@ -101,11 +101,11 @@ export function shortageChain(e: Engine, ci: number, g: number): ChainStep[] {
   });
   if (short <= 0) return steps;
   steps.push({
-    title: "2 · Priority rises",
+    title: "2 · Eagerness rises",
     text: `The port adds up its reasons to buy: ${t.terms
       .filter((x) => Math.abs(x.value) > 0.01)
       .map((x) => `${x.label} ${x.value > 0 ? "+" : "−"}${Math.abs(x.value).toFixed(2)}`)
-      .join(", ")}. Clamped, that is a priority of ${num(t.priority)}.`,
+      .join(", ")}. Kept between 0 and 1, that is an eagerness of ${num(t.priority)}.`,
     state: "active",
     jump: { kind: "price", city: ci, good: g },
   });

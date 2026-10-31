@@ -5,6 +5,7 @@ import { DepthOnly, Eq, GoodName, Link, Section, SidePill, StockBar, TermBars } 
 import { bandSentence, priceWhy, shortageChain, topTerms } from "../explain";
 import { coins, num, pct } from "../format";
 import { store, useStore } from "../store";
+import { Term } from "../term";
 
 /** Horizontal number line: sell band, buy band, global, theoretical, price and target. */
 function BandStrip({ t }: { t: NonNullable<ReturnType<typeof getTrace>> }) {
@@ -74,33 +75,49 @@ export function PriceInspect({ city: ci, good: g }: { city: number; good: number
 
       <div class="kv-row">
         <div class="kv">
-          <span class="k">{t.side === "buy" ? "Offers" : "Asks"}</span>
+          <span class="k">{t.side === "buy" ? <Term id="buy-price">Offers</Term> : <Term id="sell-price">Asks</Term>}</span>
           <span class="v num">{coins((t.side === "buy" ? st.buy : st.sell) / real)}</span>
         </div>
         <div class="kv">
-          <span class="k">Realm-wide</span>
+          <span class="k">
+            <Term id="realm-price">Realm-wide</Term>
+          </span>
           <span class="v num">{coins(t.global / real)}</span>
         </div>
         <div class="kv">
-          <span class="k">Priority</span>
+          <span class="k">
+            <Term id="priority">Eagerness</Term>
+          </span>
           <span class="v num">{num(t.priority)}</span>
         </div>
         <div class="kv">
-          <span class="k">Stock</span>
+          <span class="k">
+            <Term id="stock">Stock</Term>
+          </span>
           <span class="v num">
             {st.amount}/{t.desired}
           </span>
         </div>
       </div>
-      {s.real && <p class="small muted">Real prices: coins ÷ labour seed {num(e.s.seedValue)}, i.e. in units of labour.</p>}
+      {s.real && (
+        <p class="small muted">
+          <Term id="real-prices">Real prices</Term>: coins ÷ <Term id="labour-seed">labour seed</Term> {num(e.s.seedValue)}, i.e. in units of labour.
+        </p>
+      )}
 
-      <Section title="Stock vs target">
+      <Section title="Stock and target">
         <StockBar amount={st.amount} max={st.max} desired={t.desired} incoming={st.reservedIn} />
         <p class="small">
-          The port aims to keep its storage {pct(st.desiredFill)} full: {t.desired} of {st.max}.{" "}
-          {t.side === "buy"
-            ? `Below that it buys; the shortfall is ${pct(t.rel)} of the target.`
-            : `Above that it sells; the surplus is ${pct(t.rel)} of the room above the target.`}
+          The port's <Term id="target">target</Term> is to keep its storage {pct(st.desiredFill)} full: {t.desired} of {st.max}.{" "}
+          {t.side === "buy" ? (
+            <>
+              Below that it buys; the <Term id="shortage">shortage</Term> is {pct(t.rel)} of the target.
+            </>
+          ) : (
+            <>
+              Above that it sells; the <Term id="surplus">surplus</Term> is {pct(t.rel)} of the room above the target.
+            </>
+          )}
           {st.reservedIn > 0 && ` ${st.reservedIn} more are on the way in wagons.`}
           {st.reservedOut > 0 && ` Wagons have claimed ${st.reservedOut} of the surplus.`}
         </p>
@@ -114,22 +131,22 @@ export function PriceInspect({ city: ci, good: g }: { city: number; good: number
         )}
       </Section>
 
-      <Section title="Priority: how eager the port is">
+      <Section title="Eagerness: how badly the port wants it">
         <p class="small">
-          Each tick the port adds up reasons to {t.side === "buy" ? "pay more" : "sell cheaper"}. The sum, clamped to {t.side === "buy" ? "0.0001…1" : "0…1"}, is
-          its priority.
+          Each second the port adds up <Term id="term">reasons</Term> to {t.side === "buy" ? "pay more" : "sell cheaper"}: green bars push up, red bars hold back.
+          The sum, kept between 0 and 1, is its <Term id="priority">eagerness</Term>.
         </p>
         <TermBars terms={terms} showFormula={s.depth >= 3} />
         <p class="sum num small">
-          sum {num(t.raw)} → priority <b>{num(t.priority)}</b>
+          sum {num(t.raw)} → eagerness <b>{num(t.priority)}</b>
         </p>
       </Section>
 
       <DepthOnly min={2}>
-        <Section title="Band: where the price may go">
+        <Section title="Price range (band)">
           <BandStrip t={t} />
           <p class="small">
-            Bands are built around the realm-wide price M = {coins(t.mean)}. Buying runs from 0.7 M to 1.5 M, selling from 0.5 M to 1.3 M, so buyers pay a bit more than
+            The <Term id="band">band</Term> is built around the <Term id="realm-price">realm-wide price</Term> M = {coins(t.mean)}. Buying runs from 0.7 M to 1.5 M, selling from 0.5 M to 1.3 M, so buyers pay a bit more than
             sellers ask on average: that gap pays for the wagons. {bandSentence(t)}
           </p>
         </Section>
