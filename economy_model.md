@@ -76,6 +76,35 @@ This runs once per economy tick (1 s) for each port and each good.
 - Stock **below** target → the port **buys**. `BuyVolume = Desired − Current`, posted as a market order.
 - Stock **above** target → the port **sells**. `SellVolume = Current − Desired`.
 
+**Storage capacity (`MaxAmount`) [code].** Every good in a city's port gets the same cap:
+
+  `CurrentStorageSize = CityConstants.StorageSize (100) + GameState.GlobalCityStorageBonus`
+
+- The city computes this when it is set up and passes it to its port. The port then sets `MaxStorageSize` and every storage's `MaxAmount` to that value. If stock is above the new cap, it is cut down, and the economy's global stock total is adjusted to match.
+- Nothing scales the cap per good or with city size. Residential tiles (`MaxStockFactorPerResidentialTile`, `StoragePerInhabitant`) and production buildings keep their own small buffers. Those buffers don't feed the port's cap.
+- `GlobalCityStorageBonus` is changed only by `AddGlobalCityStorageBonus(delta)`. That does bonus = max(0, bonus + delta) and then refreshes every city's storage. It starts at 0 in a new game.
+- The only caller is the research reward handler, for effect type 10, `EResearchFinishedEffectType::GlobalCityStorageBonus`, with the value rounded to an integer.
+
+**No shipped content grants it.** The research manager lists 54 research assets. Decoding the reward of each one gives these effect types:
+
+| Effect type | Value |
+|---|---|
+| 0 (city limit) | +3, +3, +2 |
+| 1 (transporter speed) | ×1.3 |
+| 2 (transporter capacity) | ×1.4 |
+| 3 (transporter resource slots) | +1, +1, +2 |
+| 4 (trader capacity) | ×1.5 |
+| 5 (trader speed) | ×1.1, three times |
+| 7 (knight move speed) | ×1.1 |
+| 8 (knight scout package capacity) | ×1.5 |
+| None | all the building unlocks |
+
+- Types 6 (knight scout speed), 9 (city size) and 10 (city storage) are never used.
+- A localization string for a storage research exists ("All cities have {BonusValue} increased storage"), but no asset uses it.
+- The card effect `UCardPlayEffectChangeResourceStorage` and the per-good `FTradePortModifiers` (`ResourceStorageModifiers`, additive and multiplicative) are defined but referenced by no cooked asset.
+
+So in the shipped game every city holds at most **100 of each good, for the whole game**. That is why the target fill of 0.5 means 50 units everywhere. The player's castle keep is a separate case: castle buildings carry a `StorageModifier` (`FCastleStorageCapacityModifier.CapacityDelta`) **[struct]**.
+
 ### 3.2 Price bands (around the mean price M)
 
 | | Min | Max |

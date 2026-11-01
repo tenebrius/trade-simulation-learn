@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 # Defaults recovered from the game's C++ constructors (FTradePortConstants, etc.)
 TICK = 1.0                      # EconomyTickInterval
 STORAGE_SIZE = 100              # CityConstants.StorageSize
+CITY_STORAGE_BONUS = 0          # GameState.GlobalCityStorageBonus (no shipped research or card raises it)
 DESIRED_FILL = 0.5              # DefaultDesiredStorageFraction
 MAX_DEV = 0.4                   # MaxMarketPriceDeviationFraction
 BUY_SELL_SHIFT = 0.1            # RelativeBuySellIntervalShift
@@ -134,7 +135,7 @@ def recipe_values(seed, old=None):
 class Storage:
     good: str
     amount: int = 0
-    max_amount: int = STORAGE_SIZE
+    max_amount: int = STORAGE_SIZE + CITY_STORAGE_BONUS   # the same cap for every good
     desired_fill: float = DESIRED_FILL
     buy_price: float = -1.0
     sell_price: float = -1.0
