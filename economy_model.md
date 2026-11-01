@@ -116,8 +116,41 @@ The 0.4 is `MaxMarketPriceDeviationFraction`. The 0.1 is `RelativeBuySellInterva
 
 Further rules:
 - Construction materials have their max buy price multiplied by 10.
-- If no consumer depends on a good, both bounds collapse to (global + mean) / 2.
-- Critical prices come from the good's *local value*, meaning what it costs or is worth locally.
+- The bands collapse to a single price, (global + mean) / 2, in two cases **[code]**:
+  - Buy side: no transport order currently serves this port for the good.
+  - Sell side: no port anywhere asks for the good (`AskedVolume` < 1) and no city buyer is interested in it.
+- Critical prices come from the good's local value and from the competing sources (3.2.1).
+
+#### 3.2.1 Local value and critical prices [code]
+
+Each port keeps a `LocalResourceValue` per good, which the port's pricing pass recomputes (UTradePort 0x1449cb000). New values are computed from the previous ones and then written all together.
+
+**Made here from inputs.** The city has a production dependency for the good with at least one input:
+
+`LocalValue = max(0.1, Σ over inputs [qty × input's LocalValue + extra] / output qty)`
+
+- `extra = −ExpectedTrend × InternalBuyPrice` for an input that the port is buying and whose expected trend is negative, meaning the city uses it faster than it makes it. Otherwise `extra = 0`.
+- The 0.1 is `MinLocalResourceValueAssumptionRestriction`.
+- This is a cost-of-inputs value. A good made only from local inputs that the port isn't buying inherits their low local values and ends up cheap.
+
+**Everything else.** This covers goods the city imports and goods made from no inputs, such as raw goods. There is no fixed fraction of the theoretical price here:
+- While the port buys the good (internal buy price > 0, stock below desired), the value moves toward the internal buy price, which is the quoted price plus tax: `LocalValue += (Desired − Current) / Desired × (InternalBuyPrice − LocalValue)`. When the store is empty it jumps straight to the internal buy price.
+- At or above the desired amount, with a buy price still set, it equals the internal buy price.
+- While the port only sells, the value doesn't change.
+
+The result is floored at 0. I found no code that seeds a starting value, so it is presumably zero-initialised **[assumption]**.
+
+**Critical prices** (buy side 0x1449c8af0, sell side 0x1449c8fe0):
+
+| Price | Formula | Used by |
+|---|---|---|
+| `UpperCriticalBuyPrice` | `max(0.1, LocalValue)` | *Cheaper to buy than produce*: `0.2 · max(0, (upper − price)/upper) · (1 − liquidity)` |
+| `LowerCriticalBuyPrice` | `max(0.1, buy order price − max ProfitPerUnit over the port's transport orders for the good + MeanTransportCosts)` | *Overpriced buy* (3.3) |
+| `CriticalSellPrice` | `max(0.1, (100 + port tax % + resource tax %)/100 × LocalValue)` | *Selling under production cost*: `−0.2 · max(0, (critical − price)/max(price, 0.1))` |
+
+- Profit per unit is the target's buy price minus the source's sell price. So the lower critical price is the **cheapest source's sell price plus the mean transport cost**: the lowest price that still pays a trader an average haul.
+- `MeanTransportCosts` is the mean, over guild trade routes, of a per-route cost. With the guild layer dormant (5.5) there are no routes, so it stays **0** in the shipped game.
+- When no transport order serves the port, the lower critical price is not updated and the buy band collapses as described above.
 
 ### 3.3 Priority: a PID controller plus bias terms
 
@@ -132,8 +165,8 @@ Each tick the port computes a set of additive parts (`FTradePortPidParts`). On t
 | Local to global | `−1.8 · (price − global) / global` | 1.8 |
 | Remaining liquidity | `−0.8 · ExpectedRemainingLiquidityFactor` | 0.8 |
 | Income vs spending | `−0.4 · IncomeToSpendingDisparityFactor` | 0.4 |
-| Cheaper to buy than produce | `0.2 · max(0, (localValue − price)/localValue) · (1 − liquidity)` | 0.2 |
-| Overpriced buy | `−0.4 · max(0, price − lowerCritical) …` scaled by the fill target | −0.4 |
+| Cheaper to buy than produce | `0.2 · max(0, (upperCritical − price)/upperCritical) · (1 − liquidity)`, upper critical = local value (3.2.1) | 0.2 |
+| Overpriced buy | `max(0, price − lowerCritical) / mean price × (−0.4 − remaining-liquidity part − income-vs-spending part)` (3.2.1) | −0.4 |
 | High priority | flat weight if fill is below the player's high-priority threshold | per good |
 | Market share | `−(P + I + D1 parts) · 0.85 · (1 − competitor coverage) · achieved turnover` (3.3.1) | 0.85 |
 | Generosity | `(1.2 − market share part − 0.7 · money-saving parts) · wealth · (1 − liquidity factor)` (3.3.1) | 1.2, money-saver factor 0.7 |
@@ -144,7 +177,7 @@ Each tick the port computes a set of additive parts (`FTradePortPidParts`). On t
 `priority = clamp(sum × BasePriorityFactor, 0.0001, 1)`
 
 The **sell side** mirrors this. The signs flip where it makes sense (a rising stock means sell harder; being above the global price means cut the price). It adds:
-- *Selling under production cost*: `−0.2 · max(0, (value − price)/price)`.
+- *Selling under production cost*: `−0.2 · max(0, (CriticalSellPrice − price)/max(price, 0.1))`, where the critical sell price is the local value plus tax (3.2.1).
 - *Resource can't be afforded* by others: +0.2.
 - *Unused sell priority*: −0.1 when nothing is flowing.
 
@@ -322,6 +355,7 @@ Each city has 3 transporters (`NumCityTransporters`), each carrying up to 5 diff
 ### Simulation
 `ltt_sim.py` reimplements sections 2 (including the labour-seeded theoretical prices), 3, 4, 5.1–5.4 and 6.1–6.2 (production, consumption, happiness, income, migration). Each city starts with 2 city buyers, which import goods from the other cities to their home port. The dormant guild layer (5.5) is available with `--guilds`. In that mode, founding and branch decisions, which have no trigger in the shipped game, use simple stand-in rules: a guild opens a branch whenever it can afford one, and the richest port founds a new guild after the cooldown. Other simplifications:
 - Transport orders are built on the fly from port surpluses and shortfalls.
+- Local values and critical prices (3.2.1) follow the decompiled formulas. Local values start at 0 (assumed). The transport orders behind the lower critical price and the buy-band collapse are taken as every other city holding a surplus of the good, and `MeanTransportCosts` is 0, as in the guild-less shipped game.
 - Market share and generosity (3.3.1) follow the decompiled formulas. Expected trends come from staffed building rates and resident needs. The traded amount per second is a 30 s moving average (the window of the game's traded-amount history was not recovered), and the sell side has no unused-sell or income-disparity parts.
 - The guild's emergency reserve, the critical happiness (0.5), the pay interval (10 s) and the happiness weights are sim choices. Resident pay is scaled down to the sim's price level.
 - There is no player, so coins only enter through resident pay. Prices therefore inflate slowly through both money terms, as section 2 predicts.

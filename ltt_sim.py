@@ -41,6 +41,8 @@ MAX_URGENCY = 0.5               # MaxUrgencyPriceChangeBonus
 SMOOTH_TIME = 6.0               # DeltaPriceSmoothTime
 NEW_PORT_BONUS_T, NEW_PORT_BONUS_W = 400.0, 0.8
 MIN_PRICE = 0.1
+MIN_LOCAL_VALUE = 0.1           # MinLocalResourceValueAssumptionRestriction
+MEAN_TRANSPORT_COSTS = 0.0      # EconomyManagement.MeanTransportCosts: mean guild route cost, 0 without guilds
 MAX_MARKET_SHARE = 0.85         # MaxMarketShareFactor
 DESIRED_TURNOVER = 1.2          # DesiredTurnoverFractionToAchieve
 GENEROSITY_W = 1.2              # GenerosityBaseWeight
@@ -145,7 +147,9 @@ class Storage:
     integral: float = 0.0         # integrated relative discrepancy
     price_delta_smooth: float = 0.0
     priority: float = 0.0
-    local_value: float = 0.0      # what local producers would pay / it costs to make here
+    local_value: float = 0.0      # LocalResourceValue (zero-initialised: assumption)
+    lower_crit: float = MIN_PRICE # LowerCriticalBuyPrice
+    upper_crit: float = MIN_PRICE # UpperCriticalBuyPrice
 
     @property
     def desired(self):
@@ -328,16 +332,35 @@ class Economy:
                         break
 
     def local_values(self):
-        """Local value of a good: what it is worth to this city's producers/consumers."""
+        """LocalResourceValue per port and good (UTradePort 0x1449cb000). New values are computed from
+        the previous ones and written together at the end.
+        - Made here from inputs: sum over inputs of qty x input's local value, plus |trend| x internal
+          buy price for an input the city is buying and running short of, divided by output qty,
+          floored at MinLocalResourceValueAssumptionRestriction.
+        - Otherwise (imported, or made from no inputs): while the port buys the good, move toward the
+          internal buy price (quoted price incl. tax) by the missing fraction of the desired amount.
+          While it sells, the value stays put."""
         for c in self.cities:
-            made_here = {b.output for b in c.buildings}
+            made_here = {b.output for b in c.buildings if RECIPES[b.output][0]}
+            new = {}
             for g, st in c.storage.items():
-                v = self.theo[g]
                 if g in made_here:
                     inputs, out_qty, _, _ = RECIPES[g]
-                    v = sum(c.storage[i].buy_price if c.storage[i].buy_price > 0 else self.glob[i]
-                            for i, q in inputs.items() for _ in range(q)) / out_qty if inputs else v * 0.8
-                st.local_value = max(MIN_PRICE, v)
+                    v = 0.0
+                    for i, q in inputs.items():
+                        si = c.storage[i]
+                        v += q * si.local_value
+                        if si.desired > si.amount and si.expected < 0:
+                            v -= si.expected * si.buy_price * (1 + CITY_TAX)
+                    v = max(MIN_LOCAL_VALUE, v / out_qty)
+                elif st.desired > st.amount:
+                    v = st.local_value + (st.desired - st.amount) / st.desired * (
+                        st.buy_price * (1 + CITY_TAX) - st.local_value)
+                else:
+                    v = st.local_value
+                new[g] = max(0.0, v)
+            for g, v in new.items():
+                c.storage[g].local_value = v
 
     # ---------------------------------------------------------- pricing
     def expected_trends(self):
@@ -408,6 +431,15 @@ class Economy:
                     st.sell_price = (1 - START_DEV) * mean
                 missing = st.desired - st.amount
                 if missing > 0:      # ---- buying side
+                    # Critical buy prices (0x1449c8af0). Profit per unit = this buy price - source sell
+                    # price, so buy price - max profit is the cheapest source's sell price.
+                    sources = [o.storage[g].sell_price for o in self.cities
+                               if o is not c and o.storage[g].amount > o.storage[g].desired]
+                    if sources:
+                        st.lower_crit = max(MIN_PRICE, min(sources) + MEAN_TRANSPORT_COSTS)
+                        st.upper_crit = max(MIN_PRICE, st.local_value)
+                    else:            # no transport order serves this port: band collapses
+                        buy_lo = buy_hi = (mean + glob) / 2
                     rel = missing / max(st.desired, 1)
                     # windowed sum of the discrepancy over the last ~STOCK_INTEGRATION seconds
                     st.integral = st.integral * (1 - dt / STOCK_INTEGRATION) + rel * dt
@@ -415,14 +447,15 @@ class Economy:
                            - D1_W * st.expected                      # stock already rising -> relax
                            + I_W * st.integral)                      # accumulated shortage
                     inc_part = -INC_SPEND_W * max(0.0, disparity)    # spending > income
-                    over_part = OVERPRICED_BUY_F * max(0.0, st.buy_price - st.local_value) / max(mean, 1e-3)
+                    over_part = (max(0.0, st.buy_price - st.lower_crit) / max(mean, 1e-3)
+                                 * (OVERPRICED_BUY_F - REM_LIQ_W * liq_factor + inc_part))
                     share_part = -pid * self.market_share(st, g, buying=True)   # few rival buyers -> relax
                     terms = [
                         pid,
                         -L2G_W * (st.buy_price - glob) / glob,       # pull to global price
                         -REM_LIQ_W * liq_factor,                     # running out of cash
                         inc_part,
-                        CHEAPER_BUY_W * max(0.0, (st.local_value - st.buy_price) / st.local_value)
+                        CHEAPER_BUY_W * max(0.0, (st.upper_crit - st.buy_price) / st.upper_crit)
                         * (1 - liq_factor),
                         over_part,
                         share_part,
@@ -438,7 +471,11 @@ class Economy:
                     rel = surplus / max(st.max_amount - st.desired, 1)
                     st.integral = st.integral * (1 - dt / STOCK_INTEGRATION)
                     pid = P_W * rel + D1_W * st.expected             # stock still rising -> sell harder
-                    under_part = SELL_UNDER_W * max(0.0, st.local_value - st.sell_price) / max(st.sell_price, 0.1)
+                    # CriticalSellPrice (0x1449c8fe0): local value grossed up by the tax.
+                    crit_sell = max(MIN_PRICE, (1 + CITY_TAX) * st.local_value)
+                    if not any(o.storage[g].desired > o.storage[g].amount for o in self.cities):
+                        sell_lo = sell_hi = (mean + glob) / 2   # nobody asks for the good
+                    under_part = SELL_UNDER_W * max(0.0, crit_sell - st.sell_price) / max(st.sell_price, 0.1)
                     share_part = -pid * self.market_share(st, g, buying=False)  # few rival sellers -> relax
                     terms = [
                         pid,
